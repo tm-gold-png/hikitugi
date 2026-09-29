@@ -1011,6 +1011,7 @@ body.auth-locked > *:not(#firebaseAuthGate){visibility:hidden!important;}
 
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore-compat.js"></script>
 <script>
 const KEY_ITEMS='handover_items_v2';
 const KEY_MEMBERS='handover_members_v2';
@@ -1240,7 +1241,15 @@ function saveVisitPoints(){
   }
   visitPoints=saved;
   try{localStorage.setItem(KEY_VISIT_POINTS,JSON.stringify(visitPoints));}
-  catch(e){alert('保存容量を超えました。写真を減らすか画像を小さくしてください。');return;}
+  catch(e){
+    if(typeof cloudReady!=='undefined' && cloudReady){
+      scheduleCloudWrite(KEY_VISIT_POINTS);
+      console.warn('端末の保存容量を超えたため、来店ポイントはFirebase共有を優先します。',e);
+    }else{
+      alert('保存容量を超えました。Firebase共有に接続してから保存するか、写真を減らしてください。');
+      return;
+    }
+  }
   visitPointsManageDialog.close();
   alert('来店ポイント一覧を保存しました。');
 }
@@ -2156,9 +2165,8 @@ function saveCategories(){
 }
 
 
-// ===== Firebase Authentication only =====
-// 以前のFirebaseプロジェクトの登録済みアカウントをそのまま利用する。
-// 引継ぎデータの保存方式は現在のまま変更しない。
+// ===== Firebase Authentication + shared data =====
+// 以前のFirebaseアカウントで認証し、引継ぎデータ本体も各PCで共有する。
 const firebaseConfig = {
   apiKey: "AIzaSyA241WcXSucsjoixxyXVSygGeiHvF8J1d0",
   authDomain: "gold-cee80.firebaseapp.com",
@@ -2168,7 +2176,26 @@ const firebaseConfig = {
   appId: "1:4380559169:web:3e8192da6dd8c0dd7983c0",
   measurementId: "G-ZXWGV19DG9"
 };
+
+const CLOUD_KEYS = new Set([
+  KEY_ITEMS, KEY_MEMBERS, KEY_CATEGORIES, KEY_VIEWERS, KEY_ROLES, KEY_TEAMS,
+  KEY_COUNTER_ITEMS, KEY_WORK_ITEMS, KEY_VISIT_POINTS
+]);
+const CLOUD_BASIC_KEYS = new Set([
+  KEY_ITEMS, KEY_MEMBERS, KEY_CATEGORIES, KEY_VIEWERS, KEY_ROLES, KEY_TEAMS,
+  KEY_COUNTER_ITEMS, KEY_WORK_ITEMS
+]);
+const VISIT_MANIFEST_KEY=KEY_VISIT_POINTS+'__manifest_v2';
+const VISIT_CHUNK_PREFIX=KEY_VISIT_POINTS+'__chunk_v2_';
+const VISIT_CHUNK_TARGET_BYTES=380000;
+
 let firebaseAppStarted=false;
+let cloudReady=false;
+let cloudApplying=false;
+let cloudWriteTimers={};
+let db=null;
+let sharedSnapshotUnsubscribe=null;
+let visitManifestReloadTimer=null;
 
 function normalizeFirebaseLoginId(raw){
   const v=String(raw||'').trim();
@@ -2201,7 +2228,7 @@ function hideFirebaseGate(user){
   const logout=$('firebaseLogoutBtn');
   if(logout)logout.style.display='inline-block';
   const badge=$('firebaseUserBadge');
-  if(badge)badge.textContent='Firebase：'+displayFirebaseLoginId(user?.email||'ログイン済み');
+  if(badge)badge.textContent='Firebase：'+displayFirebaseLoginId(user?.email||'ログイン済み')+'・共有中';
 }
 function friendlyFirebaseAuthError(err){
   const c=err?.code||'';
@@ -2231,12 +2258,268 @@ async function loginWithExistingFirebaseAccount(){
 async function logoutFirebaseAccount(){
   if(!confirm('Firebaseからログアウトしますか？'))return;
   try{
+    cloudReady=false;
+    if(sharedSnapshotUnsubscribe){sharedSnapshotUnsubscribe();sharedSnapshotUnsubscribe=null;}
     await firebase.auth().signOut();
   }catch(err){
     console.error('Firebase logout error',err);
     alert('ログアウトに失敗しました。');
   }
 }
+
+function valueForCloudKey(key){
+  const map={
+    [KEY_ITEMS]:normalItems,
+    [KEY_MEMBERS]:members,
+    [KEY_CATEGORIES]:categories,
+    [KEY_VIEWERS]:importantViewers,
+    [KEY_ROLES]:roles,
+    [KEY_TEAMS]:teams,
+    [KEY_COUNTER_ITEMS]:counterItems,
+    [KEY_WORK_ITEMS]:workItems,
+    [KEY_VISIT_POINTS]:visitPoints
+  };
+  return map[key];
+}
+function applyCloudValue(key,value){
+  if(value===undefined || value===null)return;
+  if(key===KEY_ITEMS && Array.isArray(value)) normalItems=value;
+  else if(key===KEY_MEMBERS && Array.isArray(value)) members=value;
+  else if(key===KEY_CATEGORIES && Array.isArray(value)) categories=value;
+  else if(key===KEY_VIEWERS && Array.isArray(value)) importantViewers=value;
+  else if(key===KEY_ROLES && value && typeof value==='object') roles=value;
+  else if(key===KEY_TEAMS && value && typeof value==='object') teams=value;
+  else if(key===KEY_COUNTER_ITEMS && Array.isArray(value)) counterItems=value;
+  else if(key===KEY_WORK_ITEMS && Array.isArray(value)) workItems=value;
+  else if(key===KEY_VISIT_POINTS && Array.isArray(value)) visitPoints=value;
+}
+function hasMeaningfulLocalData(){
+  return normalItems.length>0 || counterItems.length>0 || workItems.length>0 || visitPoints.length>0;
+}
+function utf8Bytes(value){
+  try{return new TextEncoder().encode(JSON.stringify(value)).length;}catch(_){return JSON.stringify(value).length;}
+}
+function splitVisitPointsForCloud(points){
+  const chunks=[];
+  let current=[];
+  for(const item of points){
+    const candidate=current.concat([item]);
+    if(current.length && utf8Bytes(candidate)>VISIT_CHUNK_TARGET_BYTES){
+      chunks.push(current);
+      current=[item];
+    }else current=candidate;
+  }
+  if(current.length || !chunks.length)chunks.push(current);
+  return chunks;
+}
+async function pushVisitPointsSharded(){
+  if(!cloudReady || cloudApplying || !db)return;
+  try{
+    const chunks=splitVisitPointsForCloud(visitPoints);
+    const manifestRef=db.collection('appState').doc(VISIT_MANIFEST_KEY);
+    let oldCount=0;
+    try{
+      const old=await manifestRef.get();
+      if(old.exists)oldCount=Number(old.data()?.chunks||old.data()?.value?.chunks||0)||0;
+    }catch(_){ }
+    for(let i=0;i<chunks.length;i++){
+      await db.collection('appState').doc(VISIT_CHUNK_PREFIX+String(i).padStart(3,'0')).set({
+        value:chunks[i],
+        updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+      });
+    }
+    for(let i=chunks.length;i<oldCount;i++){
+      await db.collection('appState').doc(VISIT_CHUNK_PREFIX+String(i).padStart(3,'0')).delete();
+    }
+    await manifestRef.set({
+      version:2,
+      chunks:chunks.length,
+      count:visitPoints.length,
+      updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+    });
+    // 小さい場合のみ旧形式も更新し、旧版PCとの互換性をできるだけ維持する。
+    if(utf8Bytes(visitPoints)<650000){
+      await db.collection('appState').doc(KEY_VISIT_POINTS).set({
+        value:visitPoints,
+        updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+      });
+    }
+  }catch(err){
+    console.error('Firebase visit points save error',err);
+    if(err?.code==='permission-denied') alert('来店ポイントの共有保存が許可されていません。Firebaseの権限設定を確認してください。');
+  }
+}
+async function loadVisitPointsFromCloud(snapshotDocs=null){
+  try{
+    let manifest=null;
+    if(snapshotDocs && snapshotDocs.has(VISIT_MANIFEST_KEY)) manifest=snapshotDocs.get(VISIT_MANIFEST_KEY);
+    if(!manifest){
+      const m=await db.collection('appState').doc(VISIT_MANIFEST_KEY).get();
+      if(m.exists)manifest=m.data();
+    }
+    const chunkCount=Number(manifest?.chunks||manifest?.value?.chunks||0)||0;
+    if(chunkCount>0){
+      const all=[];
+      for(let i=0;i<chunkCount;i++){
+        const id=VISIT_CHUNK_PREFIX+String(i).padStart(3,'0');
+        let d=null;
+        if(snapshotDocs && snapshotDocs.has(id))d=snapshotDocs.get(id);
+        if(!d){
+          const snap=await db.collection('appState').doc(id).get();
+          if(snap.exists)d=snap.data();
+        }
+        const arr=d?.value;
+        if(Array.isArray(arr))all.push(...arr);
+      }
+      visitPoints=all;
+      return true;
+    }
+    return false;
+  }catch(err){
+    console.error('Firebase visit points load error',err);
+    return false;
+  }
+}
+
+async function pushCloudKey(key){
+  if(!cloudReady || cloudApplying || !CLOUD_KEYS.has(key) || !db)return;
+  if(key===KEY_VISIT_POINTS){await pushVisitPointsSharded();return;}
+  const value=valueForCloudKey(key);
+  try{
+    await db.collection('appState').doc(key).set({
+      value,
+      updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+    });
+  }catch(err){
+    console.error('Firebase save error',key,err);
+  }
+}
+function scheduleCloudWrite(key){
+  if(!cloudReady || cloudApplying || !CLOUD_KEYS.has(key))return;
+  clearTimeout(cloudWriteTimers[key]);
+  cloudWriteTimers[key]=setTimeout(()=>pushCloudKey(key),220);
+}
+const originalSetItem=Storage.prototype.setItem;
+Storage.prototype.setItem=function(key,value){
+  originalSetItem.call(this,key,value);
+  if(this===localStorage && CLOUD_KEYS.has(key))scheduleCloudWrite(key);
+};
+
+function cacheSharedStateLocally(){
+  cloudApplying=true;
+  try{
+    const safeSet=(key,val)=>{try{originalSetItem.call(localStorage,key,JSON.stringify(val));}catch(err){console.warn('Local cache skipped',key,err);}};
+    safeSet(KEY_ITEMS,normalItems);
+    safeSet(KEY_MEMBERS,members);
+    safeSet(KEY_CATEGORIES,categories);
+    safeSet(KEY_VIEWERS,importantViewers);
+    safeSet(KEY_ROLES,roles);
+    safeSet(KEY_TEAMS,teams);
+    safeSet(KEY_COUNTER_ITEMS,counterItems);
+    safeSet(KEY_WORK_ITEMS,workItems);
+    safeSet(KEY_VISIT_POINTS,visitPoints);
+  }finally{cloudApplying=false;}
+}
+function refreshFromSharedState(){
+  cacheSharedStateLocally();
+  if(currentMode==='counter')items=counterItems;
+  else if(currentMode==='work')items=workItems;
+  else items=normalItems;
+  setupMembers();
+  setupCategories();
+  if($('workModeBtn'))$('workModeBtn').style.display=roleOf(currentUser())==='manager'?'none':'inline-block';
+  render();
+}
+
+async function loadSharedDataForAuthenticatedUser(user){
+  try{
+    db=firebase.firestore();
+    const snap=await db.collection('appState').get();
+    const docs=new Map();
+    snap.forEach(doc=>docs.set(doc.id,doc.data()));
+
+    const relevantCloudDocs=[...docs.keys()].filter(k=>CLOUD_BASIC_KEYS.has(k) || k===KEY_VISIT_POINTS || k===VISIT_MANIFEST_KEY || k.startsWith(VISIT_CHUNK_PREFIX));
+    const cloudHasData=relevantCloudDocs.length>0;
+
+    // Firebaseが完全に空で、このPCにも実データが無い場合は初期値をアップロードしない。
+    if(!cloudHasData && !hasMeaningfulLocalData()){
+      cloudReady=false;
+      showFirebaseGate('共有データがまだFirebaseにありません。引継ぎ内容が残っている元のPCで一度この最新版を開いてログインしてください。');
+      return;
+    }
+
+    // 既存のクラウドデータを最優先で読み込む。
+    for(const key of CLOUD_BASIC_KEYS){
+      const d=docs.get(key);
+      if(d && Object.prototype.hasOwnProperty.call(d,'value'))applyCloudValue(key,d.value);
+    }
+    let loadedShardedVisits=await loadVisitPointsFromCloud(docs);
+    if(!loadedShardedVisits){
+      const legacy=docs.get(KEY_VISIT_POINTS);
+      if(legacy && Array.isArray(legacy.value))visitPoints=legacy.value;
+    }
+
+    cloudReady=true;
+
+    // Firebaseが空だった場合は、このPCの既存データを初回共有データとして登録。
+    if(!cloudHasData){
+      for(const key of CLOUD_BASIC_KEYS)await pushCloudKey(key);
+      await pushVisitPointsSharded();
+    }else{
+      // 既存Firebaseで不足している設定キーだけ補完（レコード本体を空値で上書きしない）。
+      for(const key of CLOUD_BASIC_KEYS){
+        if(!docs.has(key) && valueForCloudKey(key)!=null)await pushCloudKey(key);
+      }
+      if(!loadedShardedVisits && visitPoints.length>0)await pushVisitPointsSharded();
+    }
+
+    refreshFromSharedState();
+    hideFirebaseGate(user);
+
+    if(sharedSnapshotUnsubscribe)sharedSnapshotUnsubscribe();
+    sharedSnapshotUnsubscribe=db.collection('appState').onSnapshot(qs=>{
+      if(!cloudReady)return;
+      let changed=false;
+      let visitManifestChanged=false;
+      cloudApplying=true;
+      try{
+        qs.docChanges().forEach(ch=>{
+          if(ch.type==='removed')return;
+          const id=ch.doc.id;
+          const d=ch.doc.data();
+          if(CLOUD_BASIC_KEYS.has(id) && d && Object.prototype.hasOwnProperty.call(d,'value')){
+            applyCloudValue(id,d.value);
+            changed=true;
+          }
+          if(id===KEY_VISIT_POINTS && d && Array.isArray(d.value)){
+            // manifest未導入の旧版更新にも追従
+            visitPoints=d.value;
+            changed=true;
+          }
+          if(id===VISIT_MANIFEST_KEY)visitManifestChanged=true;
+        });
+      }finally{cloudApplying=false;}
+      if(changed)refreshFromSharedState();
+      if(visitManifestChanged){
+        clearTimeout(visitManifestReloadTimer);
+        visitManifestReloadTimer=setTimeout(async()=>{
+          if(await loadVisitPointsFromCloud())refreshFromSharedState();
+        },250);
+      }
+    },err=>console.error('Firebase realtime error',err));
+
+    console.log('Firebase認証 + 引継ぎ共有接続: OK');
+  }catch(err){
+    console.error('Firebase shared connection error',err);
+    cloudReady=false;
+    if(err?.code==='permission-denied'){
+      showFirebaseGate('ログインはできましたが、このアカウントには共有データの利用権限がありません。以前のFirebase端末アカウントか権限設定を確認してください。');
+    }else{
+      showFirebaseGate('共有データベースへの接続に失敗しました。インターネット接続を確認してください。');
+    }
+  }
+}
+
 async function startFirebaseExistingAccountLogin(){
   try{
     if(!firebaseAppStarted){
@@ -2244,9 +2527,11 @@ async function startFirebaseExistingAccountLogin(){
       firebaseAppStarted=true;
     }
     await firebase.auth().setPersistence(firebase.auth.Auth.Persistence.LOCAL);
-    firebase.auth().onAuthStateChanged(user=>{
-      if(user)hideFirebaseGate(user);
-      else showFirebaseGate();
+    firebase.auth().onAuthStateChanged(async user=>{
+      cloudReady=false;
+      if(sharedSnapshotUnsubscribe){sharedSnapshotUnsubscribe();sharedSnapshotUnsubscribe=null;}
+      if(!user){showFirebaseGate();return;}
+      await loadSharedDataForAuthenticatedUser(user);
     });
   }catch(err){
     console.error('Firebase init error',err);
