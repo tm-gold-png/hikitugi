@@ -1126,7 +1126,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
       <div id="list"></div>
     </section>
   </div>
-<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.02.7</div></main>
+<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.03.8</div></main>
 
 <dialog id="memberDialog" class="member-dialog-large">
   <h2>スタッフ管理</h2>
@@ -3534,7 +3534,7 @@ function render(){
 
 function memberRow(name='', role='staff', teamList=[]){
   const teams=Array.isArray(teamList)?[...new Set(teamList.map(normalizeTeamCode).filter(Boolean))]:[];
-  return `<div class="staff-row">
+  return `<div class="staff-row" data-original-name="${esc(name)}">
     <input class="member-name" value="${esc(name)}" placeholder="スタッフ名">
     <select class="member-role">
       <option value="staff" ${role==='staff'?'selected':''}>一般スタッフ</option>
@@ -3590,7 +3590,17 @@ async function saveMembers(){
   if(!vals.length)return alert('1名以上登録してください。');
   if(new Set(vals).size!==vals.length)return alert('同じスタッフ名が重複しています。');
 
-  const checkedViewers=[...document.querySelectorAll('.viewer-permission:checked')].map(x=>x.value);
+  // スタッフ名を変更した場合、Firebaseアカウント/端末の担当者設定も旧名→新名へ引き継ぐ。
+  const renameMap={};
+  rows.forEach(row=>{
+    const oldName=String(row.dataset.originalName||'').trim();
+    const newName=row.querySelector('.member-name')?.value.trim()||'';
+    if(oldName && newName && oldName!==newName) renameMap[oldName]=newName;
+  });
+  const migrateName=name=>renameMap[name]||name;
+
+  const checkedViewers=[...document.querySelectorAll('.viewer-permission:checked')]
+    .map(x=>migrateName(x.value));
 
   const newRoles={};
   const newTeams={};
@@ -3609,7 +3619,24 @@ async function saveMembers(){
   members=vals;
   roles=newRoles;
   teams=newTeams;
-  importantViewers=checkedViewers.filter(v=>members.includes(v));
+  importantViewers=[...new Set(checkedViewers.filter(v=>members.includes(v)))];
+
+  // 端末/Firebaseアカウントごとの担当者割り当てを、新しいスタッフ名へ自動移行。
+  Object.keys(deviceAssigneePermissions||{}).forEach(id=>{
+    const list=deviceAssigneePermissions[id];
+    if(!Array.isArray(list))return;
+    deviceAssigneePermissions[id]=[...new Set(
+      list.map(migrateName).filter(name=>members.includes(name))
+    )];
+  });
+
+  const previousCurrentUser=localStorage.getItem(KEY_USER)||'';
+  const migratedCurrentUser=migrateName(previousCurrentUser);
+  if(migratedCurrentUser && members.includes(migratedCurrentUser)){
+    originalSetItem.call(localStorage,KEY_USER,migratedCurrentUser);
+  }else if(previousCurrentUser && !members.includes(previousCurrentUser)){
+    localStorage.removeItem(KEY_USER);
+  }
 
   const btn=memberDialog?.querySelector('button[onclick="saveMembers()"]');
   const oldText=btn?.textContent||'';
@@ -3621,6 +3648,7 @@ async function saveMembers(){
     originalSetItem.call(localStorage,KEY_ROLES,JSON.stringify(roles));
     originalSetItem.call(localStorage,KEY_TEAMS,JSON.stringify(teams));
     originalSetItem.call(localStorage,KEY_VIEWERS,JSON.stringify(importantViewers));
+    originalSetItem.call(localStorage,KEY_DEVICE_ASSIGNEES,JSON.stringify(deviceAssigneePermissions));
 
     // Firebase接続中はスタッフ設定を1つのドキュメントへ一括保存する。
     // 旧4ドキュメントも同じバッチで更新し、古い端末との互換性を保つ。
@@ -3643,6 +3671,7 @@ async function saveMembers(){
       batch.set(col.doc(KEY_ROLES),{value:{...roles},clientUpdatedAt:clientVersion,updatedAt:stamp});
       batch.set(col.doc(KEY_TEAMS),{value:JSON.parse(JSON.stringify(teams)),clientUpdatedAt:clientVersion,updatedAt:stamp});
       batch.set(col.doc(KEY_VIEWERS),{value:[...importantViewers],clientUpdatedAt:clientVersion,updatedAt:stamp});
+      batch.set(col.doc(KEY_DEVICE_ASSIGNEES),{value:JSON.parse(JSON.stringify(deviceAssigneePermissions)),clientUpdatedAt:clientVersion,updatedAt:stamp});
       await batch.commit();
       useConsolidatedStaffSettings=true;
 
@@ -3656,6 +3685,7 @@ async function saveMembers(){
       originalSetItem.call(localStorage,KEY_ROLES,JSON.stringify(roles));
       originalSetItem.call(localStorage,KEY_TEAMS,JSON.stringify(teams));
       originalSetItem.call(localStorage,KEY_VIEWERS,JSON.stringify(importantViewers));
+      originalSetItem.call(localStorage,KEY_DEVICE_ASSIGNEES,JSON.stringify(deviceAssigneePermissions));
     }
 
     // 再描画時の補正保存はFirebaseへ再送しない。
