@@ -1126,7 +1126,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
       <div id="list"></div>
     </section>
   </div>
-<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.02.4</div></main>
+<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.02.5</div></main>
 
 <dialog id="memberDialog" class="member-dialog-large">
   <h2>スタッフ管理</h2>
@@ -2719,7 +2719,8 @@ function counterEligibleMembers(){
   return members.filter(name=>canRegisterCounterHandover(name));
 }
 function selectableMembersForCurrentMode(){
-  if(currentMode==='counter') return counterEligibleMembers();
+  // 所属チームは全端末共通。表示する担当者だけはログイン中のFirebase端末ID設定で絞る。
+  if(currentMode==='counter') return counterEligibleMembers().filter(name=>deviceAllowsAssignee(name));
   return members.filter(name=>deviceAllowsAssignee(name));
 }
 function populateCurrentUserForMode(){
