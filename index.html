@@ -1126,7 +1126,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
       <div id="list"></div>
     </section>
   </div>
-<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.02.6</div></main>
+<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.02.7</div></main>
 
 <dialog id="memberDialog" class="member-dialog-large">
   <h2>スタッフ管理</h2>
@@ -2495,15 +2495,63 @@ $('counterEntryForm').addEventListener('submit',e=>{
   alert('カウンター引継ぎを登録しました。');
 });
 
+function baseAckRequiredForUser(item,user){
+  if(!item||!user)return false;
+  const tt=item.targetType||'all';
+  if(tt==='all')return true;
+  if(tt==='person')return item.targetPerson===user;
+  if(tt==='manager')return roleOf(user)==='manager';
+  if(tt==='staff')return roleOf(user)==='staff';
+  if(tt==='group')return roleOf(user)===(item.authorRole||roleOf(item.author));
+  if(isTeamTarget(tt))return teamsOf(user).includes(normalizeTeamCode(tt));
+  return false;
+}
+
+function latestUnreadReplyTime(item,user){
+  const replies=Array.isArray(item?.replies)?item.replies:[];
+  let latest=0;
+  replies.forEach(r=>{
+    if((r.author||'')===user)return;
+    const t=Date.parse(r.createdAt||'')||0;
+    if(t>latest)latest=t;
+  });
+  return latest;
+}
+
+function hasUnreadReply(item,user){
+  const latest=latestUnreadReplyTime(item,user);
+  if(!latest)return false;
+  const readMap=(item.replyReadAt&&typeof item.replyReadAt==='object')?item.replyReadAt:{};
+  const readAt=Date.parse(readMap[user]||'')||0;
+  return latest>readAt;
+}
+
+function isItemUnreadForUser(item,user){
+  const baseUnread=baseAckRequiredForUser(item,user) && !(Array.isArray(item.acks)?item.acks:[]).includes(user);
+  return baseUnread || hasUnreadReply(item,user);
+}
+
+function markRepliesReadForUser(item,user){
+  if(!item||!user)return;
+  if(!item.replyReadAt||typeof item.replyReadAt!=='object')item.replyReadAt={};
+  item.replyReadAt[user]=new Date().toISOString();
+}
+
 function toggleAck(id){
   const user=currentUser();
   const it=items.find(x=>x.id===id);
-  if(!it)return;
+  if(!it||!user)return;
   it.acks=Array.isArray(it.acks)?it.acks:[];
-  if(it.acks.includes(user)){
-    it.acks=it.acks.filter(x=>x!==user);
+
+  const currentlyUnread=isItemUnreadForUser(it,user);
+  if(currentlyUnread){
+    if(!it.acks.includes(user))it.acks.push(user);
+    // 「確認済み」で、その時点までに届いている返信も確認済みにする。
+    markRepliesReadForUser(it,user);
   }else{
-    it.acks.push(user);
+    // 「確認を戻す」は元の引継ぎと返信確認の両方を未確認へ戻す。
+    it.acks=it.acks.filter(x=>x!==user);
+    if(it.replyReadAt&&typeof it.replyReadAt==='object')delete it.replyReadAt[user];
   }
   saveItems();
   render();
@@ -3355,7 +3403,7 @@ function render(){
   const user=currentUser();
   const hiddenNormalIdsForStats=Array.isArray(normalHidden[user])?normalHidden[user]:[];
   const relevant=items.filter(x=>!hiddenNormalIdsForStats.includes(x.id) && canViewItem(x,user));
-  const unread=relevant.filter(x=>!(x.acks||[]).includes(user));
+  const unread=relevant.filter(x=>isItemUnreadForUser(x,user));
 
   $('sToday').textContent=items.filter(x=>x.createdAt?.slice(0,10)===today()).length;
   $('sImportantUnread').textContent=unread.filter(x=>x.important).length;
@@ -3385,7 +3433,7 @@ function render(){
       if(!searchable.includes(q)) return false;
     }
 
-    const seen=(x.acks||[]).includes(user);
+    const seen=!isItemUnreadForUser(x,user);
     const tt=x.targetType||'all';
 
     // 全員宛は全員に表示、個人宛は指定された本人と作成者に表示
@@ -3414,8 +3462,8 @@ function render(){
   }
 
   filtered.sort((a,b)=>{
-    const au=a.important&&!(a.acks||[]).includes(user);
-    const bu=b.important&&!(b.acks||[]).includes(user);
+    const au=a.important&&isItemUnreadForUser(a,user);
+    const bu=b.important&&isItemUnreadForUser(b,user);
     if(au!==bu)return bu-au;
     return new Date(b.createdAt)-new Date(a.createdAt);
   });
@@ -3423,14 +3471,14 @@ function render(){
   $('list').innerHTML=filtered.length?filtered.map(it=>{
     const tt=it.targetType||'all';
     const targetMembers=tt==='person'?[it.targetPerson]:(isTeamTarget(tt)?members.filter(m=>teamsOf(m).includes(normalizeTeamCode(tt))):(tt==='staff'?members.filter(m=>roleOf(m)==='staff'):(tt==='manager'?members.filter(m=>roleOf(m)==='manager'):(tt==='group'?members.filter(m=>roleOf(m)===(it.authorRole||roleOf(it.author))):members))));
-    const ackCount=(it.acks||[]).filter(x=>targetMembers.includes(x)).length;
-    const unreadMembers=targetMembers.filter(m=>!(it.acks||[]).includes(m));
-    const seen=(it.acks||[]).includes(user);
+    const ackCount=targetMembers.filter(m=>!isItemUnreadForUser(it,m)).length;
+    const unreadMembers=targetMembers.filter(m=>isItemUnreadForUser(it,m));
+    const seen=!isItemUnreadForUser(it,user);
     const isAuthor=it.author===user;
     const isRecipient=tt==='person'&&it.targetPerson===user;
     const isManager=importantViewers.includes(user);
-    const canAck=tt==='all'||isRecipient||(tt==='manager'&&roleOf(user)==='manager')||(isTeamTarget(tt)&&teamsOf(user).includes(normalizeTeamCode(tt)));
-    const recipientSeen=tt==='person'?(it.acks||[]).includes(it.targetPerson):false;
+    const canAck=baseAckRequiredForUser(it,user)||hasUnreadReply(it,user);
+    const recipientSeen=tt==='person'?!isItemUnreadForUser(it,it.targetPerson):false;
     const created=new Date(it.createdAt);
     const createdText=`${created.getMonth()+1}/${created.getDate()} ${String(created.getHours()).padStart(2,'0')}:${String(created.getMinutes()).padStart(2,'0')}`;
 
