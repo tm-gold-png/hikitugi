@@ -938,7 +938,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
       <button class="btn-light" type="button" onclick="openAnnualMaintenanceProtected();closeAdminMenu()">年度更新／バックアップ</button>
       <button class="btn-light" type="button" onclick="openSummaryBoardProtected();closeAdminMenu()">集計ボード</button>
       <button class="btn-light" type="button" onclick="openDeviceScopeProtected();closeAdminMenu()">🖥 端末公開範囲設定</button>
-      <button class="btn-light" type="button" onclick="openDeviceAssigneeProtected();closeAdminMenu()">👤 端末担当者設定</button>
+      <button class="btn-light" type="button" onclick="openDeviceAssigneeProtected();closeAdminMenu()">👤 Firebaseアカウント担当者設定</button>
       <button class="btn-light" type="button" onclick="deauthorizeStoreDevice();closeAdminMenu()">🔐 端末認証を解除</button>
     </div>
   </div>
@@ -1126,7 +1126,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
       <div id="list"></div>
     </section>
   </div>
-<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.02.5</div></main>
+<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.02.6</div></main>
 
 <dialog id="memberDialog" class="member-dialog-large">
   <h2>スタッフ管理</h2>
@@ -1313,8 +1313,8 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
 <dialog id="deviceAssigneeDialog" class="admin-dialog">
   <div class="dialog-head">
     <div>
-      <h2 style="margin:0">👤 端末担当者設定</h2>
-      <div style="font-size:12px;color:#9fb0c4;margin-top:4px">端末IDごとに「現在の確認者」で選択できるスタッフを設定します。</div>
+      <h2 style="margin:0">👤 Firebaseアカウント担当者設定</h2>
+      <div style="font-size:12px;color:#9fb0c4;margin-top:4px">FirebaseアカウントIDごとに「現在の確認者」で選択できるスタッフを設定します。</div>
     </div>
     <button class="btn-light" type="button" onclick="deviceAssigneeDialog.close()">閉じる</button>
   </div>
@@ -1334,7 +1334,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
   </div>
 
   <div style="font-size:11px;color:#9fb0c4;margin-top:10px">
-    ※ 未設定の端末は全スタッフを選択できます。チェックを外したスタッフは、その端末の「現在の確認者」に表示されません。
+    ※ 店舗共用アカウント（GOLD01等）は全スタッフを利用できます。スタッフ用アカウントは、ここで割り当てたスタッフだけが「現在の確認者」に表示されます。未設定のスタッフ用アカウントでは全員を表示しません。
   </div>
 </dialog>
 
@@ -2739,7 +2739,7 @@ function populateCurrentUserForMode(){
   if($('workAuthorDisplay')) $('workAuthorDisplay').textContent=current||'選択不可';
   $('currentUserDisplay').textContent=current
     ? '選択中：'+current
-    : (currentMode==='counter'?'カウンター登録可能な担当者がいません':'この端末で選択できる担当者がいません');
+    : (currentMode==='counter'?'このFirebaseアカウントにカウンター登録可能な担当者が設定されていません':'このFirebaseアカウントに担当者が設定されていません');
   if(current) localStorage.setItem(KEY_USER,current);
 }
 function updateCounterRegistrationAccess(){
@@ -2760,22 +2760,96 @@ function isTeamTarget(code){
 
 let editingDeviceAssigneeId='';
 
+function normalizeMemberIdentity(value){
+  return String(value||'').normalize('NFKC').trim().toLowerCase().replace(/[\s\u3000._-]+/g,'');
+}
+function resolveMemberNameCandidate(value){
+  const key=normalizeMemberIdentity(value);
+  if(!key)return '';
+  return members.find(name=>normalizeMemberIdentity(name)===key)||'';
+}
+function inferMemberForAccountId(deviceId=currentDeviceId()){
+  const id=String(deviceId||'').trim();
+  const direct=resolveMemberNameCandidate(id);
+  if(direct)return direct;
+
+  const m=id.match(/^(?:staff|member|user)[-_.]?0*(\d+)$/i);
+  if(m){
+    const n=Number(m[1]);
+    if(Number.isFinite(n) && n>0){
+      const candidates=[`スタッフ${String(n).padStart(2,'0')}`,`スタッフ${n}`];
+      for(const c of candidates){
+        const found=resolveMemberNameCandidate(c);
+        if(found)return found;
+      }
+    }
+  }
+  return '';
+}
+function isSharedStoreAccountId(deviceId=currentDeviceId()){
+  const id=String(deviceId||'').trim().toUpperCase();
+  return /^(?:GOLD|STORE|SHOP|COUNTER|ADMIN|PC|TERMINAL)(?:[-_.]?\d+)?$/.test(id);
+}
+function isAllMembersAssignment(list){
+  if(!Array.isArray(list) || !members.length)return false;
+  const valid=[...new Set(list.filter(name=>members.includes(name)))];
+  return valid.length===members.length && members.every(name=>valid.includes(name));
+}
 function assigneesForDevice(deviceId=currentDeviceId()){
   const id=String(deviceId||'').trim().toUpperCase();
   const saved=deviceAssigneePermissions?.[id];
-  if(!Array.isArray(saved)) return members.slice();
-  return saved.filter(name=>members.includes(name));
+  if(Array.isArray(saved)) return saved.filter(name=>members.includes(name));
+
+  const inferred=inferMemberForAccountId(id);
+  if(inferred)return [inferred];
+  if(isSharedStoreAccountId(id))return members.slice();
+
+  // スタッフ用Firebaseアカウントは、未設定時に全員を表示しない。
+  return [];
 }
 function deviceAllowsAssignee(name){
   return assigneesForDevice().includes(name);
 }
+async function hydrateCurrentAccountAssigneeFromAllowedDevice(){
+  const id=currentDeviceId();
+  const user=firebase?.auth?.()?.currentUser;
+  if(!id || !user || Array.isArray(deviceAssigneePermissions[id]))return;
+  try{
+    const snap=await db.collection('allowedDevices').doc(user.uid).get();
+    if(!snap.exists)return;
+    const data=snap.data()||{};
+    const values=[];
+    ['staffName','memberName','name','label'].forEach(k=>{if(data[k])values.push(data[k]);});
+    ['staffNames','members','assignees'].forEach(k=>{if(Array.isArray(data[k]))values.push(...data[k]);});
+    const resolved=[...new Set(values.map(resolveMemberNameCandidate).filter(Boolean))];
+    if(resolved.length){
+      deviceAssigneePermissions[id]=resolved;
+      localStorage.setItem(KEY_DEVICE_ASSIGNEES,JSON.stringify(deviceAssigneePermissions));
+    }
+  }catch(err){
+    console.warn('Firebase account assignee lookup skipped',err);
+  }
+}
 function ensureCurrentDeviceAssigneeEntry(){
   const id=currentDeviceId();
   if(!id)return;
-  if(!Array.isArray(deviceAssigneePermissions[id])){
-    deviceAssigneePermissions[id]=members.slice();
-    localStorage.setItem(KEY_DEVICE_ASSIGNEES,JSON.stringify(deviceAssigneePermissions));
+
+  const inferred=inferMemberForAccountId(id);
+  const shared=isSharedStoreAccountId(id);
+  const saved=deviceAssigneePermissions[id];
+
+  // v5以前は未設定アカウントへ全スタッフを自動登録していた。
+  // スタッフ用アカウントに残っている「全員」設定は旧自動設定として解除する。
+  if(Array.isArray(saved)){
+    if(!shared && isAllMembersAssignment(saved)){
+      deviceAssigneePermissions[id]=inferred?[inferred]:[];
+      localStorage.setItem(KEY_DEVICE_ASSIGNEES,JSON.stringify(deviceAssigneePermissions));
+    }
+    return;
   }
+
+  deviceAssigneePermissions[id]=inferred?[inferred]:(shared?members.slice():[]);
+  localStorage.setItem(KEY_DEVICE_ASSIGNEES,JSON.stringify(deviceAssigneePermissions));
 }
 function openDeviceAssigneeProtected(){
   if(!verifyAdminPassword())return;
@@ -2811,7 +2885,7 @@ function renderDeviceAssigneeDialog(){
 
   const title=$('deviceAssigneeTitle');
   if(title) title.textContent=editingDeviceAssigneeId
-    ? `${editingDeviceAssigneeId} で選択できる担当者`
+    ? `${editingDeviceAssigneeId} アカウントで選択できる担当者`
     : '端末を選択してください';
 
   const grid=$('deviceAssigneeGrid');
@@ -3786,6 +3860,7 @@ async function loadSharedDataForAuthorizedDevice(){
 
     cloudReady=true;
     ensureCurrentDevicePermissionEntry();
+    await hydrateCurrentAccountAssigneeFromAllowedDevice();
     ensureCurrentDeviceAssigneeEntry();
     for(const key of CLOUD_KEYS){
       if(!existing.has(key)) await pushCloudKey(key);
