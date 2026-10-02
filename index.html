@@ -1126,7 +1126,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
       <div id="list"></div>
     </section>
   </div>
-<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD</div></main>
+<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.02.4</div></main>
 
 <dialog id="memberDialog" class="member-dialog-large">
   <h2>スタッフ管理</h2>
@@ -3499,16 +3499,40 @@ async function saveMembers(){
     originalSetItem.call(localStorage,KEY_TEAMS,JSON.stringify(teams));
     originalSetItem.call(localStorage,KEY_VIEWERS,JSON.stringify(importantViewers));
 
-    // Firebase接続中は共有保存が完了するまで管理画面を閉じない。
+    // Firebase接続中はスタッフ設定を1つのドキュメントへ一括保存する。
+    // 旧4ドキュメントも同じバッチで更新し、古い端末との互換性を保つ。
     if(cloudReady && db){
       staffSettingsSaving=true;
       const stamp=firebase.firestore.FieldValue.serverTimestamp();
-      await Promise.all([
-        db.collection('appState').doc(KEY_MEMBERS).set({value:members,updatedAt:stamp}),
-        db.collection('appState').doc(KEY_ROLES).set({value:roles,updatedAt:stamp}),
-        db.collection('appState').doc(KEY_TEAMS).set({value:teams,updatedAt:stamp}),
-        db.collection('appState').doc(KEY_VIEWERS).set({value:importantViewers,updatedAt:stamp})
-      ]);
+      const clientVersion=Date.now();
+      staffSettingsClientVersion=clientVersion;
+      const batch=db.batch();
+      const col=db.collection('appState');
+      batch.set(col.doc(STAFF_SETTINGS_DOC),{
+        members:[...members],
+        roles:{...roles},
+        teams:JSON.parse(JSON.stringify(teams)),
+        importantViewers:[...importantViewers],
+        clientUpdatedAt:clientVersion,
+        updatedAt:stamp
+      });
+      batch.set(col.doc(KEY_MEMBERS),{value:[...members],clientUpdatedAt:clientVersion,updatedAt:stamp});
+      batch.set(col.doc(KEY_ROLES),{value:{...roles},clientUpdatedAt:clientVersion,updatedAt:stamp});
+      batch.set(col.doc(KEY_TEAMS),{value:JSON.parse(JSON.stringify(teams)),clientUpdatedAt:clientVersion,updatedAt:stamp});
+      batch.set(col.doc(KEY_VIEWERS),{value:[...importantViewers],clientUpdatedAt:clientVersion,updatedAt:stamp});
+      await batch.commit();
+      useConsolidatedStaffSettings=true;
+
+      // 保存直後にFirebaseから読み戻し、チェック状態が本当に保存されたことを確認。
+      const verify=await col.doc(STAFF_SETTINGS_DOC).get();
+      if(!verify.exists) throw new Error('スタッフ設定の確認データが見つかりません。');
+      const vd=verify.data()||{};
+      if(Number(vd.clientUpdatedAt||0) < clientVersion) throw new Error('スタッフ設定の保存確認に失敗しました。');
+      applyStaffSettingsBundle(vd);
+      originalSetItem.call(localStorage,KEY_MEMBERS,JSON.stringify(members));
+      originalSetItem.call(localStorage,KEY_ROLES,JSON.stringify(roles));
+      originalSetItem.call(localStorage,KEY_TEAMS,JSON.stringify(teams));
+      originalSetItem.call(localStorage,KEY_VIEWERS,JSON.stringify(importantViewers));
     }
 
     // 再描画時の補正保存はFirebaseへ再送しない。
@@ -3569,7 +3593,27 @@ const CLOUD_KEYS = new Set([
 ]);
 let cloudReady=false, cloudApplying=false, cloudWriteTimers={};
 let staffSettingsSaving=false;
+const STAFF_SETTINGS_DOC='handover_staff_settings_v2';
+let useConsolidatedStaffSettings=false;
+let staffSettingsClientVersion=0;
 let db=null;
+
+function applyStaffSettingsBundle(data){
+  if(!data || typeof data!=='object') return false;
+  if(Array.isArray(data.members)) members=data.members;
+  if(data.roles && typeof data.roles==='object') roles=data.roles;
+  if(data.teams && typeof data.teams==='object') teams=data.teams;
+  if(Array.isArray(data.importantViewers)) importantViewers=data.importantViewers;
+  members.forEach(name=>{
+    if(!roles[name]) roles[name]='staff';
+    if(!Array.isArray(teams[name])) teams[name]=[];
+    teams[name]=teamsOf(name);
+  });
+  Object.keys(teams).forEach(name=>{if(!members.includes(name)) delete teams[name];});
+  const v=Number(data.clientUpdatedAt||0);
+  if(v>staffSettingsClientVersion) staffSettingsClientVersion=v;
+  return true;
+}
 
 function valueForCloudKey(key){
   const map={
@@ -3721,17 +3765,44 @@ async function loadSharedDataForAuthorizedDevice(){
     db=firebase.firestore();
     const snap=await db.collection('appState').get();
     const existing=new Set();
+    let consolidatedStaffData=null;
+    const staffKeys=[KEY_MEMBERS,KEY_ROLES,KEY_TEAMS,KEY_VIEWERS];
     snap.forEach(doc=>{
       existing.add(doc.id);
       const d=doc.data();
+      if(doc.id===STAFF_SETTINGS_DOC){
+        consolidatedStaffData=d||null;
+        return;
+      }
       if(d && Object.prototype.hasOwnProperty.call(d,'value')) applyCloudValue(doc.id,d.value);
     });
+
+    // 新しい一括スタッフ設定があれば、旧4ドキュメントより必ずこちらを優先。
+    if(consolidatedStaffData){
+      applyStaffSettingsBundle(consolidatedStaffData);
+      useConsolidatedStaffSettings=true;
+    }
 
     cloudReady=true;
     ensureCurrentDevicePermissionEntry();
     ensureCurrentDeviceAssigneeEntry();
     for(const key of CLOUD_KEYS){
       if(!existing.has(key)) await pushCloudKey(key);
+    }
+
+    // 初回だけ旧形式から新しい一括形式へ自動移行。
+    if(!useConsolidatedStaffSettings){
+      const clientVersion=Date.now();
+      staffSettingsClientVersion=clientVersion;
+      await db.collection('appState').doc(STAFF_SETTINGS_DOC).set({
+        members:[...members],
+        roles:{...roles},
+        teams:JSON.parse(JSON.stringify(teams)),
+        importantViewers:[...importantViewers],
+        clientUpdatedAt:clientVersion,
+        updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+      });
+      useConsolidatedStaffSettings=true;
     }
     refreshFromSharedState();
     hideDeviceGate();
@@ -3745,9 +3816,24 @@ async function loadSharedDataForAuthorizedDevice(){
         qs.docChanges().forEach(ch=>{
           if(ch.type==='removed')return;
           const d=ch.doc.data();
+          const staffKeys=[KEY_MEMBERS,KEY_ROLES,KEY_TEAMS,KEY_VIEWERS];
+
+          if(ch.doc.id===STAFF_SETTINGS_DOC){
+            const incomingVersion=Number(d?.clientUpdatedAt||0);
+            if(staffSettingsSaving && incomingVersion<=staffSettingsClientVersion) return;
+            if(incomingVersion && incomingVersion<staffSettingsClientVersion) return;
+            if(applyStaffSettingsBundle(d)){
+              useConsolidatedStaffSettings=true;
+              changed=true;
+            }
+            return;
+          }
+
+          // 一括スタッフ設定を使用中は、旧4ドキュメントからの巻き戻しを無視する。
+          if(useConsolidatedStaffSettings && staffKeys.includes(ch.doc.id)) return;
+          if(staffSettingsSaving && staffKeys.includes(ch.doc.id)) return;
+
           if(d && Object.prototype.hasOwnProperty.call(d,'value')){
-            const staffKeys=[KEY_MEMBERS,KEY_ROLES,KEY_TEAMS,KEY_VIEWERS];
-            if(staffSettingsSaving && staffKeys.includes(ch.doc.id)) return;
             applyCloudValue(ch.doc.id,d.value);
             changed=true;
           }
