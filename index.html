@@ -3460,7 +3460,7 @@ function addMemberInput(){
     if(input) input.focus();
   }
 }
-function saveMembers(){
+async function saveMembers(){
   const rows=[...document.querySelectorAll('#memberInputs .staff-row')];
   const vals=rows.map(row=>row.querySelector('.member-name')?.value.trim()||'').filter(Boolean);
 
@@ -3479,8 +3479,8 @@ function saveMembers(){
     const role=row.querySelector('.member-role')?.value||'staff';
     newRoles[name]=role;
 
-    const selectedTeams=[...row.querySelectorAll('.member-team:checked')].map(x=>x.value);
-    newTeams[name]=selectedTeams;
+    const selectedTeams=[...row.querySelectorAll('.member-team:checked')].map(x=>normalizeTeamCode(x.value)).filter(Boolean);
+    newTeams[name]=[...new Set(selectedTeams)];
   });
 
   members=vals;
@@ -3488,23 +3488,46 @@ function saveMembers(){
   teams=newTeams;
   importantViewers=checkedViewers.filter(v=>members.includes(v));
 
-  localStorage.setItem(KEY_MEMBERS,JSON.stringify(members));
-  localStorage.setItem(KEY_ROLES,JSON.stringify(roles));
-  localStorage.setItem(KEY_TEAMS,JSON.stringify(teams));
-  localStorage.setItem(KEY_VIEWERS,JSON.stringify(importantViewers));
+  const btn=memberDialog?.querySelector('button[onclick="saveMembers()"]');
+  const oldText=btn?.textContent||'';
+  if(btn){btn.disabled=true;btn.textContent='保存中…';}
 
-  // スタッフ管理の所属チームは全端末共通。保存直後にFirebaseへ反映を促す。
-  if(cloudReady){
-    pushCloudKey(KEY_MEMBERS);
-    pushCloudKey(KEY_ROLES);
-    pushCloudKey(KEY_TEAMS);
-    pushCloudKey(KEY_VIEWERS);
+  try{
+    // まずこの端末へ確実に保存。クラウド書込みの二重予約は行わない。
+    originalSetItem.call(localStorage,KEY_MEMBERS,JSON.stringify(members));
+    originalSetItem.call(localStorage,KEY_ROLES,JSON.stringify(roles));
+    originalSetItem.call(localStorage,KEY_TEAMS,JSON.stringify(teams));
+    originalSetItem.call(localStorage,KEY_VIEWERS,JSON.stringify(importantViewers));
+
+    // Firebase接続中は共有保存が完了するまで管理画面を閉じない。
+    if(cloudReady && db){
+      staffSettingsSaving=true;
+      const stamp=firebase.firestore.FieldValue.serverTimestamp();
+      await Promise.all([
+        db.collection('appState').doc(KEY_MEMBERS).set({value:members,updatedAt:stamp}),
+        db.collection('appState').doc(KEY_ROLES).set({value:roles,updatedAt:stamp}),
+        db.collection('appState').doc(KEY_TEAMS).set({value:teams,updatedAt:stamp}),
+        db.collection('appState').doc(KEY_VIEWERS).set({value:importantViewers,updatedAt:stamp})
+      ]);
+    }
+
+    // 再描画時の補正保存はFirebaseへ再送しない。
+    const prevCloudApplying=cloudApplying;
+    cloudApplying=true;
+    try{ setupMembers(); }
+    finally{ cloudApplying=prevCloudApplying; }
+
+    updateTargetTypeOptions();
+    memberDialog.close();
+    render();
+    alert('スタッフ設定を保存しました。チーム設定は全端末共通です。');
+  }catch(err){
+    console.error('Staff settings save error',err);
+    alert('スタッフ設定の共有保存に失敗しました。通信状態を確認して、もう一度保存してください。');
+  }finally{
+    staffSettingsSaving=false;
+    if(btn){btn.disabled=false;btn.textContent=oldText||'保存';}
   }
-
-  setupMembers();
-  updateTargetTypeOptions();
-  memberDialog.close();
-  render();
 }
 
 function categoryRow(name=''){
@@ -3545,6 +3568,7 @@ const CLOUD_KEYS = new Set([
   KEY_COUNTER_ITEMS, KEY_WORK_ITEMS, KEY_REPAIR_ITEMS, KEY_VISIT_POINTS, KEY_DEVICE_SCOPES, KEY_DEVICE_ASSIGNEES
 ]);
 let cloudReady=false, cloudApplying=false, cloudWriteTimers={};
+let staffSettingsSaving=false;
 let db=null;
 
 function valueForCloudKey(key){
@@ -3722,6 +3746,8 @@ async function loadSharedDataForAuthorizedDevice(){
           if(ch.type==='removed')return;
           const d=ch.doc.data();
           if(d && Object.prototype.hasOwnProperty.call(d,'value')){
+            const staffKeys=[KEY_MEMBERS,KEY_ROLES,KEY_TEAMS,KEY_VIEWERS];
+            if(staffSettingsSaving && staffKeys.includes(ch.doc.id)) return;
             applyCloudValue(ch.doc.id,d.value);
             changed=true;
           }
