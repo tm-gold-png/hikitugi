@@ -2164,6 +2164,7 @@ function switchMode(mode){
   const general=roleOf(currentUser())!=='manager';
   $('workModeBtn').style.display=general?'inline-block':'none';
   $('repairModeBtn').style.display='inline-block';
+  populateCurrentUserForMode();
   if($('normalFormWrap'))$('normalFormWrap').style.display=!isCounter&&!isWork&&!isRepair?'block':'none';
   updateCounterRegistrationAccess();
   if($('workFormWrap'))$('workFormWrap').style.display=isWork?'block':'none';
@@ -2183,27 +2184,18 @@ function switchMode(mode){
 function setupMembers(){
   if(!members.length) members=DEFAULT_MEMBERS.slice();
 
-  const selectableMembers=members.filter(m=>deviceAllowsAssignee(m));
-  let current=localStorage.getItem(KEY_USER)||selectableMembers[0]||'';
+  importantViewers=importantViewers.filter(v=>members.includes(v));
+  members.forEach((m,i)=>{
+    if(!roles[m]) roles[m]=i<15?'staff':'manager';
+    if(!Array.isArray(teams[m])) teams[m]=[];
+    teams[m]=teamsOf(m);
+  });
+  Object.keys(teams).forEach(name=>{if(!members.includes(name)) delete teams[name];});
 
-  if(!selectableMembers.includes(current)) current=selectableMembers[0]||'';
-
-  const opts=selectableMembers.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('');
-  $('currentUser').innerHTML=opts;
   $('targetPerson').innerHTML=members.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('');
-
-  $('currentUser').value=current;
-  $('authorDisplay').textContent=current||'選択不可';
-  if($('repairAuthorDisplay')) $('repairAuthorDisplay').textContent=current||'選択不可';
-  if($('counterReceiverDisplay')) $('counterReceiverDisplay').textContent=current||'選択不可';
-  $('currentUserDisplay').textContent=current?'選択中：'+current:'この端末で選択できる担当者がいません';
-
-  if(current)localStorage.setItem(KEY_USER,current);
+  populateCurrentUserForMode();
 
   updateTargetTypeOptions();
-  importantViewers=importantViewers.filter(v=>members.includes(v));
-  members.forEach((m,i)=>{if(!roles[m])roles[m]=i<15?'staff':'manager'; if(!Array.isArray(teams[m])) teams[m]=[];});
-  Object.keys(teams).forEach(name=>{if(!members.includes(name)) delete teams[name];});
   localStorage.setItem(KEY_VIEWERS,JSON.stringify(importantViewers));
   localStorage.setItem(KEY_ROLES,JSON.stringify(roles));
   localStorage.setItem(KEY_TEAMS,JSON.stringify(teams));
@@ -2257,8 +2249,9 @@ function updateTargetTypeOptions(){
 
 function currentUser(){
   const selected=$('currentUser')?.value||'';
-  if(selected && deviceAllowsAssignee(selected)) return selected;
-  return members.find(m=>deviceAllowsAssignee(m))||'';
+  const allowed=selectableMembersForCurrentMode();
+  if(selected && allowed.includes(selected)) return selected;
+  return allowed[0]||'';
 }
 
 $('currentUser').addEventListener('change',()=>{
@@ -2687,17 +2680,26 @@ function roleOf(name){
   return roles[name]||'staff';
 }
 function normalizeTeamCode(code){
+  const key=String(code??'').trim();
   return ({
     sales:'team_sales',
+    '営業':'team_sales',
+    '営業チーム':'team_sales',
     service:'team_service',
+    '接客':'team_service',
+    '接客チーム':'team_service',
     counter:'team_counter',
+    'カウンター':'team_counter',
+    'カウンターチーム':'team_counter',
     equipment:'team_facility',
     facility:'team_facility',
+    '設備':'team_facility',
+    '設備チーム':'team_facility',
     team_sales:'team_sales',
     team_service:'team_service',
     team_counter:'team_counter',
     team_facility:'team_facility'
-  })[code]||'';
+  })[key]||'';
 }
 function teamsOf(name){
   const list=Array.isArray(teams[name])?teams[name]:[];
@@ -2706,14 +2708,43 @@ function teamsOf(name){
 function isCounterTeamMember(name){
   return teamsOf(name).includes('team_counter');
 }
-function canRegisterCounterHandover(name=currentUser()){
+function canRegisterCounterHandover(name){
   if(!name)return false;
   return roleOf(name)==='manager' || isCounterTeamMember(name);
+}
+function counterEligibleMembers(){
+  return members.filter(name=>deviceAllowsAssignee(name) && canRegisterCounterHandover(name));
+}
+function selectableMembersForCurrentMode(){
+  if(currentMode==='counter') return counterEligibleMembers();
+  return members.filter(name=>deviceAllowsAssignee(name));
+}
+function populateCurrentUserForMode(){
+  const select=$('currentUser');
+  if(!select)return;
+  const allowed=selectableMembersForCurrentMode();
+  const saved=localStorage.getItem(KEY_USER)||'';
+  const before=select.value||'';
+  const current=allowed.includes(before)?before:(allowed.includes(saved)?saved:(allowed[0]||''));
+  select.innerHTML=allowed.map(m=>`<option value="${esc(m)}">${esc(m)}</option>`).join('');
+  select.value=current;
+
+  $('authorDisplay').textContent=current||'選択不可';
+  if($('repairAuthorDisplay')) $('repairAuthorDisplay').textContent=current||'選択不可';
+  if($('counterReceiverDisplay')) $('counterReceiverDisplay').textContent=current||'登録できる担当者がいません';
+  if($('workAuthorDisplay')) $('workAuthorDisplay').textContent=current||'選択不可';
+  $('currentUserDisplay').textContent=current
+    ? '選択中：'+current
+    : (currentMode==='counter'?'カウンター登録可能な担当者がいません':'この端末で選択できる担当者がいません');
+  if(current) localStorage.setItem(KEY_USER,current);
 }
 function updateCounterRegistrationAccess(){
   const wrap=$('counterFormWrap');
   if(!wrap)return;
-  wrap.style.display=(currentMode==='counter' && canRegisterCounterHandover(currentUser()))?'block':'none';
+  const user=currentUser();
+  const allowed=currentMode==='counter' && !!user && canRegisterCounterHandover(user);
+  wrap.style.display=allowed?'block':'none';
+  if($('counterReceiverDisplay')) $('counterReceiverDisplay').textContent=user||'登録できる担当者がいません';
 }
 function teamLabel(code){
   return ({team_sales:'営業チーム',team_service:'接客チーム',team_counter:'カウンターチーム',team_facility:'設備チーム'})[normalizeTeamCode(code)]||'';
