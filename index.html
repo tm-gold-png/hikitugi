@@ -1126,7 +1126,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
       <div id="list"></div>
     </section>
   </div>
-<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.03.9</div></main>
+<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.03.10</div></main>
 
 <dialog id="memberDialog" class="member-dialog-large">
   <h2>スタッフ管理</h2>
@@ -2846,9 +2846,14 @@ function isAllMembersAssignment(list){
 function assigneesForDevice(deviceId=currentDeviceId()){
   const id=String(deviceId||'').trim().toUpperCase();
 
-  // GOLD01などの共用店舗アカウントは、常に最新のスタッフ一覧を表示する。
-  // 旧い担当者リストがFirebaseに残っていても、新規追加・改名したスタッフを欠落させない。
-  if(isSharedStoreAccountId(id)) return members.slice();
+  // GOLD01～GOLD09は役職者のみ、GOLD10は一般スタッフのみ表示する。
+  // 判定は「スタッフ管理」で設定した役職（manager / staff）をそのまま使用する。
+  if(/^GOLD0[1-9]$/.test(id)){
+    return members.filter(name=>roleOf(name)==='manager');
+  }
+  if(id==='GOLD10'){
+    return members.filter(name=>roleOf(name)!=='manager');
+  }
 
   const saved=deviceAssigneePermissions?.[id];
   if(Array.isArray(saved)) return saved.filter(name=>members.includes(name));
