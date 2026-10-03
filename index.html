@@ -1126,7 +1126,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
       <div id="list"></div>
     </section>
   </div>
-<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.03.11</div></main>
+<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.03.12</div></main>
 
 <dialog id="memberDialog" class="member-dialog-large">
   <h2>スタッフ管理</h2>
@@ -1721,9 +1721,11 @@ function openVisitPointsList(){
   visitPointsDialog.showModal();
 }
 function openVisitPointsManageProtected(){
-  const entered=prompt('管理パスワードを入力してください。');
-  if(entered===null)return;
-  if(entered!==ADMIN_PASSWORD){alert('パスワードが違います。');return;}
+  if(!isGold01SuperAdmin()){
+    const entered=prompt('管理パスワードを入力してください。');
+    if(entered===null)return;
+    if(entered!==ADMIN_PASSWORD){alert('パスワードが違います。');return;}
+  }
   openVisitPointsManage();
 }
 function visitPointManageRow(item={}){
@@ -1791,11 +1793,13 @@ function saveVisitPoints(){
 let annualBackupDownloaded=false;
 
 function openAnnualMaintenanceProtected(){
-  const entered=prompt('管理パスワードを入力してください。');
-  if(entered===null)return;
-  if(entered!==ADMIN_PASSWORD){
-    alert('パスワードが違います。');
-    return;
+  if(!isGold01SuperAdmin()){
+    const entered=prompt('管理パスワードを入力してください。');
+    if(entered===null)return;
+    if(entered!==ADMIN_PASSWORD){
+      alert('パスワードが違います。');
+      return;
+    }
   }
   annualBackupDownloaded=false;
   if($('annualBackupStatus')){
@@ -2037,9 +2041,11 @@ async function resetAnnualData(){
 
 
 function openSummaryBoardProtected(){
-  const entered=prompt('管理パスワードを入力してください。');
-  if(entered===null)return;
-  if(entered!==ADMIN_PASSWORD){alert('パスワードが違います。');return;}
+  if(!isGold01SuperAdmin()){
+    const entered=prompt('管理パスワードを入力してください。');
+    if(entered===null)return;
+    if(entered!==ADMIN_PASSWORD){alert('パスワードが違います。');return;}
+  }
   setSummaryPeriod('month',false);
   renderSummaryBoard();
   summaryBoardDialog.showModal();
@@ -2642,11 +2648,13 @@ function removeItem(id){
 }
 
 function startBulkDelete(){
-  const entered=prompt('一括削除を開始するには管理パスワードを入力してください。');
-  if(entered===null) return;
-  if(entered!==ADMIN_PASSWORD){
-    alert('パスワードが違います。');
-    return;
+  if(!isGold01SuperAdmin()){
+    const entered=prompt('一括削除を開始するには管理パスワードを入力してください。');
+    if(entered===null) return;
+    if(entered!==ADMIN_PASSWORD){
+      alert('パスワードが違います。');
+      return;
+    }
   }
 
   bulkDeleteMode=true;
@@ -3002,6 +3010,12 @@ function currentDeviceId(){
     return String(email.split('@')[0]||'').toUpperCase();
   }catch(_){ return ''; }
 }
+function isGold01SuperAdmin(){
+  return currentDeviceId()==='GOLD01';
+}
+function canManagerEdit(){
+  return isGold01SuperAdmin() || roleOf(currentUser())==='manager';
+}
 function normalizedDeviceScopeCode(tt){
   if(tt==='group') return roleOf(currentUser())==='manager'?'manager':'all';
   if(tt==='staff') return 'all';
@@ -3078,6 +3092,7 @@ function publicScopeLabel(item){
 }
 
 function canViewItem(item,user){
+  if(isGold01SuperAdmin()) return true;
   const tt=item.targetType||'all';
   if(!deviceAllowsScope(tt)) return false;
   if(tt==='all') return true;
@@ -3133,6 +3148,18 @@ function approveCounterItem(id){
   if(!confirm('このカウンター引継ぎを承認しますか？\\n承認日から2か月後に削除されます。')) return;
   it.approvedAt=new Date().toISOString();
   it.approvedBy=currentUser();
+  localStorage.setItem(KEY_COUNTER_ITEMS,JSON.stringify(counterItems));
+  if(currentMode==='counter') items=counterItems;
+  render();
+}
+
+function revokeCounterApproval(id){
+  if(!isGold01SuperAdmin()) return alert('承認を戻せるのはGOLD01のみです。');
+  const it=counterItems.find(x=>x.id===id);
+  if(!it || !it.approvedAt || it.approvalRequired===false) return;
+  if(!confirm('このカウンター引継ぎの承認を未承認に戻しますか？\n承認による自動削除予定も解除されます。')) return;
+  it.approvedAt='';
+  it.approvedBy='';
   localStorage.setItem(KEY_COUNTER_ITEMS,JSON.stringify(counterItems));
   if(currentMode==='counter') items=counterItems;
   render();
@@ -3280,15 +3307,17 @@ function renderRepair(){
 
 function updateCounterBulkButtons(){
   const start=$('counterBulkStartBtn'), exec=$('counterBulkExecBtn'), cancel=$('counterBulkCancelBtn');
-  if(start) start.style.display=(roleOf(currentUser())==='manager'&&!counterBulkDeleteMode)?'inline-block':'none';
+  if(start) start.style.display=(canManagerEdit()&&!counterBulkDeleteMode)?'inline-block':'none';
   if(exec){exec.style.display=counterBulkDeleteMode?'inline-block':'none';exec.textContent=`選択したデータを削除（${counterBulkDeleteSelected.size}件）`;}
   if(cancel) cancel.style.display=counterBulkDeleteMode?'inline-block':'none';
 }
 function startCounterBulkDelete(){
-  if(roleOf(currentUser())!=='manager')return alert('カウンター引継ぎは役職者のみ利用できます。');
-  const entered=prompt('一括削除を開始するには管理パスワードを入力してください。');
-  if(entered===null)return;
-  if(entered!==ADMIN_PASSWORD)return alert('パスワードが違います。');
+  if(!canManagerEdit())return alert('カウンター引継ぎは役職者のみ利用できます。');
+  if(!isGold01SuperAdmin()){
+    const entered=prompt('一括削除を開始するには管理パスワードを入力してください。');
+    if(entered===null)return;
+    if(entered!==ADMIN_PASSWORD)return alert('パスワードが違います。');
+  }
   counterBulkDeleteMode=true;counterBulkDeleteSelected.clear();updateCounterBulkButtons();renderCounter();
 }
 function cancelCounterBulkDelete(){
@@ -3314,7 +3343,7 @@ function renderCounter(){
   items=counterItems.slice();
 
   const user=currentUser();
-  const hiddenIds=Array.isArray(counterHidden[user])?counterHidden[user]:[];
+  const hiddenIds=isGold01SuperAdmin()?[]:(Array.isArray(counterHidden[user])?counterHidden[user]:[]);
   const visibleCounterItems=counterItems.filter(x=>!hiddenIds.includes(x.id));
 
   const todayCount=visibleCounterItems.filter(x=>x.createdAt?.slice(0,10)===today()).length;
@@ -3348,12 +3377,13 @@ function renderCounter(){
           : approved
             ? `<div style="font-weight:900;color:#65d98a">✓ 承認済み</div>
                <div style="font-size:11px;color:#aab7c8;margin-top:3px">${esc(it.approvedBy||'')}・${approvedText}</div>
-               <div style="font-size:11px;color:#f7c84b;margin-top:3px">${deleteText} 削除予定</div>`
-            : (roleOf(user)==='manager'
+               <div style="font-size:11px;color:#f7c84b;margin-top:3px">${deleteText} 削除予定</div>
+               ${isGold01SuperAdmin()?`<button class="btn-light" style="margin-top:6px" onclick="revokeCounterApproval('${it.id}')">承認を戻す</button>`:''}`
+            : (canManagerEdit()
                 ? `<button class="btn-primary" onclick="approveCounterItem('${it.id}')">承認</button>`
                 : `<span class="badge b-normal">未承認</span>`)}
       </td>
-      <td>${roleOf(user)==='manager'?`<button class="btn-danger" onclick="removeCounterItem('${it.id}')">自分から削除</button>`:''}</td>
+      <td>${canManagerEdit()?`<button class="btn-danger" onclick="removeCounterItem('${it.id}')">自分から削除</button>`:''}</td>
     </tr>`;
   }).join('');
 
@@ -3380,17 +3410,18 @@ function renderCounter(){
             : approved
               ? `<div style="font-weight:900;color:#65d98a">✓ 承認済み</div>
                  <div style="font-size:12px;color:#aab7c8">${esc(it.approvedBy||'')}・${approvedText}</div>
-                 <div style="font-size:12px;color:#f7c84b">${deleteText} 削除予定</div>`
-              : (roleOf(user)==='manager'
+                 <div style="font-size:12px;color:#f7c84b">${deleteText} 削除予定</div>
+                 ${isGold01SuperAdmin()?`<button class="btn-light" style="margin-top:6px" onclick="revokeCounterApproval('${it.id}')">承認を戻す</button>`:''}`
+              : (canManagerEdit()
                   ? `<button class="btn-primary" onclick="approveCounterItem('${it.id}')">承認</button>`
                   : `<span class="badge b-normal">未承認</span>`)}
         </div>
-        ${roleOf(user)==='manager'?`<button class="btn-danger" onclick="removeCounterItem('${it.id}')">自分から削除</button>`:''}
+        ${canManagerEdit()?`<button class="btn-danger" onclick="removeCounterItem('${it.id}')">自分から削除</button>`:''}
       </div>
     </div>`;
   }).join('');
 
-  const readOnlyNote=roleOf(user)!=='manager'
+  const readOnlyNote=!canManagerEdit()
     ? `<div style="margin-bottom:10px;padding:9px 12px;border:1px solid #35506b;border-radius:10px;background:#0d2033;color:#bcd2e8;font-size:12px">一般スタッフはカウンター引継ぎを閲覧できます。登録・承認・削除は役職者のみ可能です。</div>`
     : '';
 
@@ -3424,7 +3455,7 @@ function render(){
   }
   items=normalItems.slice();
   const user=currentUser();
-  const hiddenNormalIdsForStats=Array.isArray(normalHidden[user])?normalHidden[user]:[];
+  const hiddenNormalIdsForStats=isGold01SuperAdmin()?[]:(Array.isArray(normalHidden[user])?normalHidden[user]:[]);
   const relevant=items.filter(x=>!hiddenNormalIdsForStats.includes(x.id) && canViewItem(x,user));
   const unread=relevant.filter(x=>isItemUnreadForUser(x,user));
 
@@ -3438,7 +3469,7 @@ function render(){
   const ft=$('fTarget').value;
   const q=($('handoverSearch')?.value||'').trim().toLowerCase();
 
-  const normalHiddenIds=Array.isArray(normalHidden[user])?normalHidden[user]:[];
+  const normalHiddenIds=isGold01SuperAdmin()?[]:(Array.isArray(normalHidden[user])?normalHidden[user]:[]);
 
   let filtered=items.filter(x=>{
     if(normalHiddenIds.includes(x.id)) return false;
@@ -3571,6 +3602,7 @@ function memberRow(name='', role='staff', teamList=[]){
   </div>`;
 }
 function verifyAdminPassword(){
+  if(isGold01SuperAdmin()) return true;
   const entered=prompt('管理パスワードを入力してください。');
   if(entered===null) return false;
   if(entered!==ADMIN_PASSWORD){
