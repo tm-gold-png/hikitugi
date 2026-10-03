@@ -1126,7 +1126,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
       <div id="list"></div>
     </section>
   </div>
-<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.03.8</div></main>
+<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.03.9</div></main>
 
 <dialog id="memberDialog" class="member-dialog-large">
   <h2>スタッフ管理</h2>
@@ -2187,7 +2187,7 @@ function setupMembers(){
 
   importantViewers=importantViewers.filter(v=>members.includes(v));
   members.forEach((m,i)=>{
-    if(!roles[m]) roles[m]=i<15?'staff':'manager';
+    if(!roles[m]) roles[m]='staff';
     if(!Array.isArray(teams[m])) teams[m]=[];
     teams[m]=teamsOf(m);
   });
@@ -2845,12 +2845,16 @@ function isAllMembersAssignment(list){
 }
 function assigneesForDevice(deviceId=currentDeviceId()){
   const id=String(deviceId||'').trim().toUpperCase();
+
+  // GOLD01などの共用店舗アカウントは、常に最新のスタッフ一覧を表示する。
+  // 旧い担当者リストがFirebaseに残っていても、新規追加・改名したスタッフを欠落させない。
+  if(isSharedStoreAccountId(id)) return members.slice();
+
   const saved=deviceAssigneePermissions?.[id];
   if(Array.isArray(saved)) return saved.filter(name=>members.includes(name));
 
   const inferred=inferMemberForAccountId(id);
   if(inferred)return [inferred];
-  if(isSharedStoreAccountId(id))return members.slice();
 
   // スタッフ用Firebaseアカウントは、未設定時に全員を表示しない。
   return [];
@@ -2886,17 +2890,24 @@ function ensureCurrentDeviceAssigneeEntry(){
   const shared=isSharedStoreAccountId(id);
   const saved=deviceAssigneePermissions[id];
 
+  // GOLD01などの共用店舗アカウントは、スタッフ名変更・追加後も必ず最新一覧へ同期する。
+  if(shared){
+    deviceAssigneePermissions[id]=members.slice();
+    localStorage.setItem(KEY_DEVICE_ASSIGNEES,JSON.stringify(deviceAssigneePermissions));
+    return;
+  }
+
   // v5以前は未設定アカウントへ全スタッフを自動登録していた。
   // スタッフ用アカウントに残っている「全員」設定は旧自動設定として解除する。
   if(Array.isArray(saved)){
-    if(!shared && isAllMembersAssignment(saved)){
+    if(isAllMembersAssignment(saved)){
       deviceAssigneePermissions[id]=inferred?[inferred]:[];
       localStorage.setItem(KEY_DEVICE_ASSIGNEES,JSON.stringify(deviceAssigneePermissions));
     }
     return;
   }
 
-  deviceAssigneePermissions[id]=inferred?[inferred]:(shared?members.slice():[]);
+  deviceAssigneePermissions[id]=inferred?[inferred]:[];
   localStorage.setItem(KEY_DEVICE_ASSIGNEES,JSON.stringify(deviceAssigneePermissions));
 }
 function openDeviceAssigneeProtected(){
@@ -3623,6 +3634,11 @@ async function saveMembers(){
 
   // 端末/Firebaseアカウントごとの担当者割り当てを、新しいスタッフ名へ自動移行。
   Object.keys(deviceAssigneePermissions||{}).forEach(id=>{
+    // 共用店舗アカウントは常に最新の全スタッフを候補にする。
+    if(isSharedStoreAccountId(id)){
+      deviceAssigneePermissions[id]=members.slice();
+      return;
+    }
     const list=deviceAssigneePermissions[id];
     if(!Array.isArray(list))return;
     deviceAssigneePermissions[id]=[...new Set(
@@ -3913,6 +3929,56 @@ async function deauthorizeStoreDevice(){
   }
 }
 
+const STAFF_REPAIR_V9_DOC='handover_staff_repair_v20261003_9';
+
+async function runStaffRepairV9(existingDocs){
+  if(!db || existingDocs?.has(STAFF_REPAIR_V9_DOC)) return;
+
+  let changed=false;
+
+  // 既存データ補正：ユーザー確認済みの一般スタッフ「鳥飼」が役職者扱いになった誤データを1回だけ修復する。
+  if(members.includes('鳥飼') && roles['鳥飼']!=='staff'){
+    roles['鳥飼']='staff';
+    changed=true;
+  }
+
+  // 共用店舗アカウントの担当者候補は、現在のスタッフ一覧へ同期する。
+  Object.keys(deviceAssigneePermissions||{}).forEach(id=>{
+    if(!isSharedStoreAccountId(id)) return;
+    const next=members.slice();
+    const prev=Array.isArray(deviceAssigneePermissions[id])?deviceAssigneePermissions[id]:[];
+    if(prev.length!==next.length || next.some((name,i)=>prev[i]!==name)){
+      deviceAssigneePermissions[id]=next;
+      changed=true;
+    }
+  });
+
+  const batch=db.batch();
+  const col=db.collection('appState');
+  const stamp=firebase.firestore.FieldValue.serverTimestamp();
+  const clientVersion=Date.now();
+
+  if(changed){
+    staffSettingsClientVersion=Math.max(staffSettingsClientVersion,clientVersion);
+    batch.set(col.doc(STAFF_SETTINGS_DOC),{
+      members:[...members],
+      roles:{...roles},
+      teams:JSON.parse(JSON.stringify(teams)),
+      importantViewers:[...importantViewers],
+      clientUpdatedAt:clientVersion,
+      updatedAt:stamp
+    });
+    batch.set(col.doc(KEY_ROLES),{value:{...roles},clientUpdatedAt:clientVersion,updatedAt:stamp});
+    batch.set(col.doc(KEY_DEVICE_ASSIGNEES),{value:JSON.parse(JSON.stringify(deviceAssigneePermissions)),clientUpdatedAt:clientVersion,updatedAt:stamp});
+  }
+
+  batch.set(col.doc(STAFF_REPAIR_V9_DOC),{done:true,updatedAt:stamp});
+  await batch.commit();
+
+  originalSetItem.call(localStorage,KEY_ROLES,JSON.stringify(roles));
+  originalSetItem.call(localStorage,KEY_DEVICE_ASSIGNEES,JSON.stringify(deviceAssigneePermissions));
+}
+
 async function loadSharedDataForAuthorizedDevice(){
   try{
     db=firebase.firestore();
@@ -3937,6 +4003,7 @@ async function loadSharedDataForAuthorizedDevice(){
     }
 
     cloudReady=true;
+    await runStaffRepairV9(existing);
     ensureCurrentDevicePermissionEntry();
     await hydrateCurrentAccountAssigneeFromAllowedDevice();
     ensureCurrentDeviceAssigneeEntry();
