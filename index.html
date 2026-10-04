@@ -1126,7 +1126,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
       <div id="list"></div>
     </section>
   </div>
-<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.04.13</div></main>
+<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.04.14</div></main>
 
 <dialog id="memberDialog" class="member-dialog-large">
   <h2>スタッフ管理</h2>
@@ -2640,8 +2640,10 @@ function removeItem(id){
   const user=currentUser();
   if(!confirm('この引継ぎを自分の画面から削除しますか？\n他のスタッフには引き続き表示されます。')) return;
 
+  const hiddenId=String(id);
   if(!Array.isArray(normalHidden[user])) normalHidden[user]=[];
-  if(!normalHidden[user].includes(id)) normalHidden[user].push(id);
+  normalHidden[user]=[...new Set(normalHidden[user].map(String))];
+  if(!normalHidden[user].includes(hiddenId)) normalHidden[user].push(hiddenId);
 
   localStorage.setItem(KEY_NORMAL_HIDDEN,JSON.stringify(normalHidden));
   render();
@@ -3169,8 +3171,10 @@ function removeCounterItem(id){
   const user=currentUser();
   if(!confirm('このカウンター引継ぎを自分の画面から削除しますか？\n他のスタッフには引き続き表示されます。')) return;
 
+  const hiddenId=String(id);
   if(!Array.isArray(counterHidden[user])) counterHidden[user]=[];
-  if(!counterHidden[user].includes(id)) counterHidden[user].push(id);
+  counterHidden[user]=[...new Set(counterHidden[user].map(String))];
+  if(!counterHidden[user].includes(hiddenId)) counterHidden[user].push(hiddenId);
 
   localStorage.setItem(KEY_COUNTER_HIDDEN,JSON.stringify(counterHidden));
   render();
@@ -3343,8 +3347,8 @@ function renderCounter(){
   items=counterItems.slice();
 
   const user=currentUser();
-  const hiddenIds=Array.isArray(counterHidden[user])?counterHidden[user]:[];
-  const visibleCounterItems=counterItems.filter(x=>!hiddenIds.includes(x.id));
+  const hiddenIds=new Set((Array.isArray(counterHidden[user])?counterHidden[user]:[]).map(String));
+  const visibleCounterItems=counterItems.filter(x=>!hiddenIds.has(String(x.id)));
 
   const todayCount=visibleCounterItems.filter(x=>x.createdAt?.slice(0,10)===today()).length;
   const approvedCount=visibleCounterItems.filter(x=>x.approvalRequired!==false && x.approvedAt).length;
@@ -3455,8 +3459,8 @@ function render(){
   }
   items=normalItems.slice();
   const user=currentUser();
-  const hiddenNormalIdsForStats=isGold01SuperAdmin()?[]:(Array.isArray(normalHidden[user])?normalHidden[user]:[]);
-  const relevant=items.filter(x=>!hiddenNormalIdsForStats.includes(x.id) && canViewItem(x,user));
+  const hiddenNormalIdsForStats=new Set((Array.isArray(normalHidden[user])?normalHidden[user]:[]).map(String));
+  const relevant=items.filter(x=>!hiddenNormalIdsForStats.has(String(x.id)) && canViewItem(x,user));
   const unread=relevant.filter(x=>isItemUnreadForUser(x,user));
 
   $('sToday').textContent=items.filter(x=>x.createdAt?.slice(0,10)===today()).length;
@@ -3469,10 +3473,10 @@ function render(){
   const ft=$('fTarget').value;
   const q=($('handoverSearch')?.value||'').trim().toLowerCase();
 
-  const normalHiddenIds=isGold01SuperAdmin()?[]:(Array.isArray(normalHidden[user])?normalHidden[user]:[]);
+  const normalHiddenIds=new Set((Array.isArray(normalHidden[user])?normalHidden[user]:[]).map(String));
 
   let filtered=items.filter(x=>{
-    if(normalHiddenIds.includes(x.id)) return false;
+    if(normalHiddenIds.has(String(x.id))) return false;
 
     if(q){
       const searchable=[
