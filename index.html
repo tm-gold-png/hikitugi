@@ -1126,7 +1126,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
       <div id="list"></div>
     </section>
   </div>
-<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.03.12</div></main>
+<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.04.13</div></main>
 
 <dialog id="memberDialog" class="member-dialog-large">
   <h2>スタッフ管理</h2>
@@ -3343,7 +3343,7 @@ function renderCounter(){
   items=counterItems.slice();
 
   const user=currentUser();
-  const hiddenIds=isGold01SuperAdmin()?[]:(Array.isArray(counterHidden[user])?counterHidden[user]:[]);
+  const hiddenIds=Array.isArray(counterHidden[user])?counterHidden[user]:[];
   const visibleCounterItems=counterItems.filter(x=>!hiddenIds.includes(x.id));
 
   const todayCount=visibleCounterItems.filter(x=>x.createdAt?.slice(0,10)===today()).length;
