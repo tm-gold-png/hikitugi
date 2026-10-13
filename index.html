@@ -971,7 +971,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
             </div>
             <div id="handoverPhotoPreview" class="photo-preview">
               <img id="handoverPhotoPreviewImg" alt="添付写真プレビュー">
-              <span style="font-size:11px;color:#9fb0c4">登録時に自動で軽量化します</span>
+              <span style="font-size:11px;color:#9fb0c4">登録時に自動軽量化し、引継ぎ1件ごとに保存します</span>
             </div>
           </div>
 
@@ -1126,7 +1126,7 @@ body.device-locked > *:not(#deviceAuthGate){visibility:hidden!important;}
       <div id="list"></div>
     </section>
   </div>
-<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.04.14</div></main>
+<div class="footer-brand">MONACO PALACE GOLD ・ HIKITSUGI BOARD ・ v2026.10.13.16</div></main>
 
 <dialog id="memberDialog" class="member-dialog-large">
   <h2>スタッフ管理</h2>
@@ -1608,7 +1608,7 @@ function closePhotoDialog(){
   }
 }
 
-function compressImageFile(file,maxSize=1280,quality=.72){
+function compressImageFile(file,maxSize=1200,quality=.68,maxDataUrlChars=460000){
   return new Promise((resolve,reject)=>{
     const reader=new FileReader();
     reader.onerror=()=>reject(new Error('画像を読み込めませんでした。'));
@@ -1616,13 +1616,35 @@ function compressImageFile(file,maxSize=1280,quality=.72){
       const img=new Image();
       img.onerror=()=>reject(new Error('画像を開けませんでした。'));
       img.onload=()=>{
-        let w=img.width,h=img.height;
-        const scale=Math.min(1,maxSize/Math.max(w,h));
-        w=Math.round(w*scale);h=Math.round(h*scale);
-        const canvas=document.createElement('canvas');
-        canvas.width=w;canvas.height=h;
-        canvas.getContext('2d').drawImage(img,0,0,w,h);
-        resolve(canvas.toDataURL('image/jpeg',quality));
+        try{
+          const originalMax=Math.max(img.width,img.height);
+          let dimension=Math.min(maxSize,originalMax||maxSize);
+          let q=quality;
+          let best='';
+
+          for(let attempt=0;attempt<9;attempt++){
+            const scale=Math.min(1,dimension/originalMax);
+            const w=Math.max(1,Math.round(img.width*scale));
+            const h=Math.max(1,Math.round(img.height*scale));
+            const canvas=document.createElement('canvas');
+            canvas.width=w; canvas.height=h;
+            const ctx=canvas.getContext('2d');
+            ctx.drawImage(img,0,0,w,h);
+            best=canvas.toDataURL('image/jpeg',q);
+            if(best.length<=maxDataUrlChars){
+              resolve(best);
+              return;
+            }
+            if(q>0.46)q=Math.max(0.46,q-0.08);
+            else dimension=Math.max(640,Math.round(dimension*0.82));
+          }
+
+          if(best && best.length<=700000){
+            resolve(best);
+            return;
+          }
+          reject(new Error('写真を十分に軽量化できませんでした。別の写真を選択してください。'));
+        }catch(err){reject(err);}
       };
       img.src=reader.result;
     };
@@ -1660,6 +1682,161 @@ $('clearHandoverPhoto').addEventListener('click',()=>{
   $('clearHandoverPhoto').style.display='none';
 });
 
+function handoverPhotoSrc(item){
+  if(!item)return '';
+  return item.imageData||item.imageUrl||'';
+}
+
+const NORMAL_ITEM_DOC_PREFIX='handover_item_v16_';
+const NORMAL_ITEM_KIND='normalHandoverV16';
+const NORMAL_ITEMS_MIGRATION_DOC='handover_items_v16_migrated';
+const NORMAL_ITEM_MAX_BYTES=800*1024;
+
+function normalItemDocIdV16(itemId){
+  const safe=String(itemId||'').replace(/[^a-zA-Z0-9_-]/g,'_');
+  return NORMAL_ITEM_DOC_PREFIX+(safe||('item_'+Date.now()));
+}
+function isNormalItemDocIdV16(docId){
+  return String(docId||'').startsWith(NORMAL_ITEM_DOC_PREFIX);
+}
+function normalItemSortV16(list){
+  return [...list].sort((a,b)=>String(b?.createdAt||'').localeCompare(String(a?.createdAt||'')));
+}
+function normalItemJsonV16(item){
+  return JSON.stringify(item||{});
+}
+function normalItemBytesV16(item){
+  return new Blob([normalItemJsonV16(item)]).size;
+}
+function assertNormalItemSizeV16(item){
+  const bytes=normalItemBytesV16(item);
+  if(bytes>NORMAL_ITEM_MAX_BYTES){
+    throw new Error(`写真付き引継ぎが大きすぎます（約${Math.ceil(bytes/1024)}KB）。別の写真を選択してください。`);
+  }
+}
+function localNormalCacheV16(){
+  return normalItems.map(it=>{
+    const copy={...it};
+    // 写真本体はFirestoreから読み込む。localStorageには持たせず容量不足を防止する。
+    if(copy.imageData)copy.imageData='';
+    return copy;
+  });
+}
+function cacheNormalItemsLocallyV16(){
+  try{
+    originalSetItem.call(localStorage,KEY_ITEMS,JSON.stringify(localNormalCacheV16()));
+  }catch(err){
+    console.warn('Local normal handover cache skipped',err);
+  }
+}
+async function writeNormalItemDocV16(item){
+  if(!db||!cloudReady)throw new Error('共有データベースに接続されていません。');
+  if(!item?.id)throw new Error('引継ぎIDがありません。');
+  assertNormalItemSizeV16(item);
+  const docId=normalItemDocIdV16(item.id);
+  await db.collection('appState').doc(docId).set({
+    kind:NORMAL_ITEM_KIND,
+    item:item,
+    updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+  });
+  normalItemCloudState.set(String(item.id),normalItemJsonV16(item));
+}
+async function saveNormalItemConfirmedV16(item){
+  await writeNormalItemDocV16(item);
+  cacheNormalItemsLocallyV16();
+}
+async function migrateLegacyNormalItemsV16(itemsToMigrate){
+  if(!db||!cloudReady)return;
+  const source=Array.isArray(itemsToMigrate)?itemsToMigrate:[];
+  const missing=source.filter(it=>it?.id && !normalItemCloudState.has(String(it.id)));
+
+  for(let offset=0;offset<missing.length;offset+=350){
+    const chunk=missing.slice(offset,offset+350);
+    const batch=db.batch();
+    for(const it of chunk){
+      try{assertNormalItemSizeV16(it);}catch(err){
+        console.warn('Legacy handover migration skipped oversized item',it?.id,err);
+        continue;
+      }
+      batch.set(db.collection('appState').doc(normalItemDocIdV16(it.id)),{
+        kind:NORMAL_ITEM_KIND,
+        item:it,
+        updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+      });
+    }
+    await batch.commit();
+    for(const it of chunk){
+      if(it?.id && normalItemBytesV16(it)<=NORMAL_ITEM_MAX_BYTES){
+        normalItemCloudState.set(String(it.id),normalItemJsonV16(it));
+      }
+    }
+  }
+  await db.collection('appState').doc(NORMAL_ITEMS_MIGRATION_DOC).set({
+    done:true,
+    count:normalItemCloudState.size,
+    updatedAt:firebase.firestore.FieldValue.serverTimestamp()
+  });
+  cacheNormalItemsLocallyV16();
+  console.log(`Legacy normal handovers migrated to per-document storage: ${missing.length}`);
+}
+async function syncNormalItemsPerDocumentV16(){
+  if(!db||!cloudReady||normalItemsSyncRunning){
+    if(normalItemsSyncRunning)normalItemsSyncQueued=true;
+    return;
+  }
+  normalItemsSyncRunning=true;
+  try{
+    const current=new Map();
+    normalItems.forEach(it=>{if(it?.id)current.set(String(it.id),it);});
+    const writes=[];
+    const deletes=[];
+
+    for(const [id,it] of current){
+      assertNormalItemSizeV16(it);
+      const json=normalItemJsonV16(it);
+      if(normalItemCloudState.get(id)!==json)writes.push([id,it,json]);
+    }
+    for(const id of normalItemCloudState.keys()){
+      if(!current.has(id))deletes.push(id);
+    }
+
+    const ops=[];
+    for(const [id,it,json] of writes)ops.push({type:'set',id,it,json});
+    for(const id of deletes)ops.push({type:'delete',id});
+
+    for(let offset=0;offset<ops.length;offset+=350){
+      const chunk=ops.slice(offset,offset+350);
+      const batch=db.batch();
+      for(const op of chunk){
+        const ref=db.collection('appState').doc(normalItemDocIdV16(op.id));
+        if(op.type==='set'){
+          batch.set(ref,{kind:NORMAL_ITEM_KIND,item:op.it,updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
+        }else{
+          batch.delete(ref);
+        }
+      }
+      await batch.commit();
+      for(const op of chunk){
+        if(op.type==='set')normalItemCloudState.set(op.id,op.json);
+        else normalItemCloudState.delete(op.id);
+      }
+    }
+  }catch(err){
+    console.error('Normal handover per-document sync error',err);
+    alert('引継ぎの共有保存に失敗しました。通信状態を確認してください。');
+  }finally{
+    normalItemsSyncRunning=false;
+    if(normalItemsSyncQueued){
+      normalItemsSyncQueued=false;
+      setTimeout(syncNormalItemsPerDocumentV16,80);
+    }
+  }
+}
+function scheduleNormalItemsSyncV16(){
+  if(!cloudReady||cloudApplying)return;
+  clearTimeout(normalItemsSyncTimer);
+  normalItemsSyncTimer=setTimeout(syncNormalItemsPerDocumentV16,180);
+}
 
 function normalizeStoredTeams(){
   const normalized={};
@@ -1889,7 +2066,7 @@ function buildExcelBackup(backup){
     '確認者':Array.isArray(it.acks)?it.acks.join('、'):'',
     '返信件数':Array.isArray(it.replies)?it.replies.length:0,
     '返信内容':Array.isArray(it.replies)?it.replies.map(r=>`${safeBackupText(r.author)} ${excelDateText(r.createdAt)}：${safeBackupText(r.content)}`).join('\n'):'',
-    '写真':it.imageData?'あり':'なし'
+    '写真':handoverPhotoSrc(it)?'あり':'なし'
   }));
   const wsNormal=XLSX.utils.json_to_sheet(normalRows.length?normalRows:[{'登録日時':'','記入者':'','分類':'','重要':'','公開範囲':'','個人宛先':'','引継ぎ内容':'','確認者':'','返信件数':'','返信内容':'','写真':''}]);
   wsNormal['!cols']=[
@@ -2288,53 +2465,79 @@ $('targetType').addEventListener('change',()=>{
 ['fPriority','fAck','fTarget'].forEach(id=>$(id).addEventListener('change',render));
 $('handoverSearch').addEventListener('input',render);
 
-$('entryForm').addEventListener('submit',e=>{
-  if(!currentUser()){alert('この端末で選択できる担当者が設定されていません。');return;}
+$('entryForm').addEventListener('submit',async e=>{
   e.preventDefault();
+  if(!currentUser()){alert('\u3053\u306e\u7aef\u672b\u3067\u9078\u629e\u3067\u304d\u308b\u62c5\u5f53\u8005\u304c\u8a2d\u5b9a\u3055\u308c\u3066\u3044\u307e\u305b\u3093\u3002');return;}
 
   const content=$('content').value.trim();
   if(!content){
-    alert('引継ぎ内容を入力してください。');
+    alert('\u5f15\u7d99\u304e\u5185\u5bb9\u3092\u5165\u529b\u3057\u3066\u304f\u3060\u3055\u3044\u3002');
     return;
   }
 
   const user=currentUser();
   let targetType=$('targetType').value;
-  if(!targetType || !deviceAllowsScope(targetType)){alert('この端末では選択した公開範囲に登録できません。');return;}
+  if(!targetType || !deviceAllowsScope(targetType)){alert('\u3053\u306e\u7aef\u672b\u3067\u306f\u9078\u629e\u3057\u305f\u516c\u958b\u7bc4\u56f2\u306b\u767b\u9332\u3067\u304d\u307e\u305b\u3093\u3002');return;}
 
   if(roleOf(user)!=='manager' && !['all','person'].includes(targetType)){
     targetType='all';
     $('targetType').value='all';
     $('targetPersonGroup').style.display='none';
   }
-  const item={
-    id:String(Date.now())+'_'+Math.random().toString(36).slice(2),
-    content,
-    author:user,
-    targetType,
-    targetPerson:targetType==='person' ? $('targetPerson').value : '',
-    authorRole:roles[user]||'staff',
-    category:$('category').value,
-    important:$('important').checked,
-    imageData:pendingHandoverPhoto||'',
-    createdAt:new Date().toISOString(),
-    acks:[]
-  };
 
-  items.unshift(item);
-  saveItems();
+  const submitBtn=$('entryForm').querySelector('button[type="submit"]');
+  const oldText=submitBtn?.textContent||'';
+  const beforeItems=normalItems.slice();
+  let item=null;
 
-  $('content').value='';
-  $('important').checked=false;
-  pendingHandoverPhoto='';
-  $('handoverPhoto').value='';
-  $('handoverPhotoPreview').style.display='none';
-  $('clearHandoverPhoto').style.display='none';
-  $('targetType').value='all';
-  $('targetPersonGroup').style.display='none';
+  try{
+    if(submitBtn){submitBtn.disabled=true;submitBtn.textContent='登録中…';}
+    if(!cloudReady||!db)throw new Error('共有データベースに接続されていません。');
 
-  render();
-  alert(currentMode==='counter'?'カウンター引継ぎを登録しました。':'引継ぎを登録しました。');
+    const itemId=String(Date.now())+'_'+Math.random().toString(36).slice(2);
+    const createdAt=new Date().toISOString();
+
+    item={
+      id:itemId,
+      content,
+      author:user,
+      targetType,
+      targetPerson:targetType==='person' ? $('targetPerson').value : '',
+      authorRole:roles[user]||'staff',
+      category:$('category').value,
+      important:$('important').checked,
+      imageData:pendingHandoverPhoto||'',
+      imageUrl:'',
+      createdAt,
+      acks:[]
+    };
+
+    assertNormalItemSizeV16(item);
+    normalItems.unshift(item);
+    items=normalItems;
+    await saveNormalItemConfirmedV16(item);
+
+    $('content').value='';
+    $('important').checked=false;
+    pendingHandoverPhoto='';
+    $('handoverPhoto').value='';
+    $('handoverPhotoPreview').style.display='none';
+    $('clearHandoverPhoto').style.display='none';
+    $('targetType').value='all';
+    $('targetPersonGroup').style.display='none';
+
+    render();
+    alert('引継ぎを共有データベースへ登録しました。');
+  }catch(err){
+    console.error('Handover registration error',err);
+    normalItems=beforeItems;
+    items=normalItems;
+    cacheNormalItemsLocallyV16();
+    render();
+    alert('登録に失敗しました。\n'+(err?.message||'共有保存に失敗しました。')+'\n入力内容はそのまま残しています。');
+  }finally{
+    if(submitBtn){submitBtn.disabled=false;submitBtn.textContent=oldText||'✦ 引継ぎを登録';}
+  }
 });
 
 
@@ -3485,7 +3688,7 @@ function render(){
         x.category,
         publicScopeLabel(x),
         x.targetPerson,
-        x.imageData?'写真':'',
+        handoverPhotoSrc(x)?'写真':'',
         ...(Array.isArray(x.replies)?x.replies.flatMap(r=>[r.author,r.content]):[])
       ].filter(Boolean).join(' ').toLowerCase();
       if(!searchable.includes(q)) return false;
@@ -3561,7 +3764,7 @@ function render(){
 }</span>
       </div>
       <div class="body">${esc(it.content)}</div>
-      ${it.imageData?`<div class="handover-photo"><img src="${it.imageData}" alt="添付写真" onclick="openPhotoDialog(this.src)"></div>`:''}
+      ${handoverPhotoSrc(it)?`<div class="handover-photo"><img src="${handoverPhotoSrc(it)}" alt="添付写真" onclick="openPhotoDialog(this.src)"></div>`:''}
       <div class="meta" style="font-size:13px;margin-top:8px"><span><strong>記入者：${esc(it.author)}</strong></span><span>登録：${createdText}</span></div>
       ${it.important && importantViewers.includes(user) ? `
         <div class="important-status">
@@ -3805,7 +4008,7 @@ const firebaseConfig = {
 };
 
 const CLOUD_KEYS = new Set([
-  KEY_ITEMS, KEY_MEMBERS, KEY_CATEGORIES, KEY_VIEWERS, KEY_ROLES, KEY_TEAMS,
+  KEY_MEMBERS, KEY_CATEGORIES, KEY_VIEWERS, KEY_ROLES, KEY_TEAMS,
   KEY_COUNTER_ITEMS, KEY_WORK_ITEMS, KEY_REPAIR_ITEMS, KEY_VISIT_POINTS, KEY_DEVICE_SCOPES, KEY_DEVICE_ASSIGNEES
 ]);
 let cloudReady=false, cloudApplying=false, cloudWriteTimers={};
@@ -3814,6 +4017,10 @@ const STAFF_SETTINGS_DOC='handover_staff_settings_v2';
 let useConsolidatedStaffSettings=false;
 let staffSettingsClientVersion=0;
 let db=null;
+let normalItemCloudState=new Map();
+let normalItemsSyncTimer=null;
+let normalItemsSyncRunning=false;
+let normalItemsSyncQueued=false;
 
 function applyStaffSettingsBundle(data){
   if(!data || typeof data!=='object') return false;
@@ -3851,7 +4058,7 @@ function valueForCloudKey(key){
 }
 function applyCloudValue(key,value){
   if(value===undefined || value===null)return;
-  if(key===KEY_ITEMS) normalItems=value;
+  if(key===KEY_ITEMS) return;
   else if(key===KEY_MEMBERS) members=value;
   else if(key===KEY_CATEGORIES) categories=value;
   else if(key===KEY_VIEWERS) importantViewers=value;
@@ -3883,6 +4090,11 @@ function scheduleCloudWrite(key){
 }
 const originalSetItem=Storage.prototype.setItem;
 Storage.prototype.setItem=function(key,value){
+  if(this===localStorage && key===KEY_ITEMS){
+    cacheNormalItemsLocallyV16();
+    scheduleNormalItemsSyncV16();
+    return;
+  }
   originalSetItem.call(this,key,value);
   if(this===localStorage && CLOUD_KEYS.has(key)) scheduleCloudWrite(key);
 };
@@ -3890,7 +4102,7 @@ Storage.prototype.setItem=function(key,value){
 function refreshFromSharedState(){
   cloudApplying=true;
   try{
-    originalSetItem.call(localStorage,KEY_ITEMS,JSON.stringify(normalItems));
+    cacheNormalItemsLocallyV16();
     originalSetItem.call(localStorage,KEY_MEMBERS,JSON.stringify(members));
     originalSetItem.call(localStorage,KEY_CATEGORIES,JSON.stringify(categories));
     originalSetItem.call(localStorage,KEY_VIEWERS,JSON.stringify(importantViewers));
@@ -4033,24 +4245,58 @@ async function loadSharedDataForAuthorizedDevice(){
     const snap=await db.collection('appState').get();
     const existing=new Set();
     let consolidatedStaffData=null;
+    let legacyNormalItems=[];
+    let normalItemsMigrationDone=false;
+    const perDocItems=[];
+    normalItemCloudState=new Map();
     const staffKeys=[KEY_MEMBERS,KEY_ROLES,KEY_TEAMS,KEY_VIEWERS];
+
     snap.forEach(doc=>{
       existing.add(doc.id);
-      const d=doc.data();
+      const d=doc.data()||{};
+
+      if(isNormalItemDocIdV16(doc.id) && d.kind===NORMAL_ITEM_KIND && d.item?.id){
+        perDocItems.push(d.item);
+        normalItemCloudState.set(String(d.item.id),normalItemJsonV16(d.item));
+        return;
+      }
+      if(doc.id===KEY_ITEMS){
+        if(Array.isArray(d.value))legacyNormalItems=d.value;
+        return;
+      }
+      if(doc.id===NORMAL_ITEMS_MIGRATION_DOC){
+        normalItemsMigrationDone=!!d.done;
+        return;
+      }
       if(doc.id===STAFF_SETTINGS_DOC){
         consolidatedStaffData=d||null;
         return;
       }
-      if(d && Object.prototype.hasOwnProperty.call(d,'value')) applyCloudValue(doc.id,d.value);
+      if(Object.prototype.hasOwnProperty.call(d,'value')) applyCloudValue(doc.id,d.value);
     });
 
-    // 新しい一括スタッフ設定があれば、旧4ドキュメントより必ずこちらを優先。
+    // 移行完了後は旧一括データを二度と読み戻さない。削除済み引継ぎの復活を防ぐ。
+    const merged=new Map();
+    if(!normalItemsMigrationDone){
+      for(const it of legacyNormalItems){if(it?.id)merged.set(String(it.id),it);}
+      // Firestoreに旧データが無い初回だけ、端末キャッシュを復旧元として利用する。
+      if(!legacyNormalItems.length && !perDocItems.length){
+        for(const it of normalItems){if(it?.id)merged.set(String(it.id),it);}
+      }
+    }
+    for(const it of perDocItems){if(it?.id)merged.set(String(it.id),it);}
+    normalItems=normalItemSortV16([...merged.values()]);
+
     if(consolidatedStaffData){
       applyStaffSettingsBundle(consolidatedStaffData);
       useConsolidatedStaffSettings=true;
     }
 
     cloudReady=true;
+
+    // 初回だけ旧handover_items_v2を個別ドキュメントへ移行する。
+    if(!normalItemsMigrationDone)await migrateLegacyNormalItemsV16(normalItems);
+    else cacheNormalItemsLocallyV16();
     await runStaffRepairV9(existing);
     ensureCurrentDevicePermissionEntry();
     await hydrateCurrentAccountAssigneeFromAllowedDevice();
@@ -4059,7 +4305,6 @@ async function loadSharedDataForAuthorizedDevice(){
       if(!existing.has(key)) await pushCloudKey(key);
     }
 
-    // 初回だけ旧形式から新しい一括形式へ自動移行。
     if(!useConsolidatedStaffSettings){
       const clientVersion=Date.now();
       staffSettingsClientVersion=clientVersion;
@@ -4083,8 +4328,33 @@ async function loadSharedDataForAuthorizedDevice(){
       cloudApplying=true;
       try{
         qs.docChanges().forEach(ch=>{
+          const d=ch.doc.data()||{};
+
+          if(isNormalItemDocIdV16(ch.doc.id)){
+            if(ch.type==='removed'){
+              const removedId=[...normalItemCloudState.keys()].find(id=>normalItemDocIdV16(id)===ch.doc.id);
+              if(removedId){
+                normalItemCloudState.delete(removedId);
+                normalItems=normalItems.filter(it=>String(it?.id)!==removedId);
+                changed=true;
+              }
+              return;
+            }
+            if(d.kind===NORMAL_ITEM_KIND && d.item?.id){
+              const id=String(d.item.id);
+              normalItemCloudState.set(id,normalItemJsonV16(d.item));
+              const idx=normalItems.findIndex(it=>String(it?.id)===id);
+              if(idx>=0)normalItems[idx]=d.item;
+              else normalItems.push(d.item);
+              normalItems=normalItemSortV16(normalItems);
+              changed=true;
+            }
+            return;
+          }
+
+          // 旧一括引継ぎデータと移行マーカーはv16では更新元として使わない。
+          if(ch.doc.id===KEY_ITEMS || ch.doc.id===NORMAL_ITEMS_MIGRATION_DOC)return;
           if(ch.type==='removed')return;
-          const d=ch.doc.data();
           const staffKeys=[KEY_MEMBERS,KEY_ROLES,KEY_TEAMS,KEY_VIEWERS];
 
           if(ch.doc.id===STAFF_SETTINGS_DOC){
@@ -4098,11 +4368,10 @@ async function loadSharedDataForAuthorizedDevice(){
             return;
           }
 
-          // 一括スタッフ設定を使用中は、旧4ドキュメントからの巻き戻しを無視する。
           if(useConsolidatedStaffSettings && staffKeys.includes(ch.doc.id)) return;
           if(staffSettingsSaving && staffKeys.includes(ch.doc.id)) return;
 
-          if(d && Object.prototype.hasOwnProperty.call(d,'value')){
+          if(Object.prototype.hasOwnProperty.call(d,'value')){
             applyCloudValue(ch.doc.id,d.value);
             changed=true;
           }
@@ -4111,7 +4380,7 @@ async function loadSharedDataForAuthorizedDevice(){
       if(changed)refreshFromSharedState();
     },err=>console.error('Firebase realtime error',err));
 
-    console.log('店舗端末認証 + Firebase共有接続: OK');
+    console.log('店舗端末認証 + Firebase共有接続（v16個別引継ぎ保存）: OK');
   }catch(err){
     console.error('Firebase authorized connection error',err);
     cloudReady=false;
