@@ -146,12 +146,14 @@ import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, setPe
 import { getFirestore, collection, doc, getDoc, setDoc, updateDoc, deleteDoc, serverTimestamp, query, orderBy, onSnapshot, where, documentId } from 'https://www.gstatic.com/firebasejs/12.18.0/firebase-firestore.js';
 import { getStorage, ref as storageRef, uploadBytes, getDownloadURL, deleteObject } from 'https://www.gstatic.com/firebasejs/12.18.0/firebase-storage.js';
 
-const VERSION='2026.10.14.12';
+const VERSION='2026.10.14.13';
 const META_COLLECTION='appState';
 const DOC_PREFIX='watchlistSimple_v2_';
 const LEGACY_COLLECTION='watchlistSimple';
 const STORAGE_PREFIX='handover_photos';
-const UPLOAD_TIMEOUT_MS=45000;
+const PHOTO_DOC_PREFIX='watchlistPhoto_v3_';
+const PHOTO_MARKER='fsphoto:';
+const PHOTO_DATAURL_MAX_CHARS=700000;
 const STALE_UPLOAD_MS=90000;
 const firebaseConfig={
   apiKey:'AIzaSyA241WcXSucsjoixxyXVSygGeiHvF8J1d0',
@@ -219,7 +221,20 @@ function clearPendingEntries(itemId,entries){const current=pendingOf(itemId);con
 function displayPhotosOf(r){return [...photoPathsOf(r).map(path=>({kind:'cloud',path})),...pendingOf(r.id).map(x=>({kind:'pending',url:x.url}))]}
 function render(){const list=filtered();el.totalCount.textContent=records.length;el.visibleCount.textContent=list.length;const hasFilter=!!categoryFilter||!!el.searchInput.value.trim();el.empty.classList.toggle('hidden',records.length!==0||hasFilter);if(records.length&&list.length===0){el.grid.innerHTML='<div class="empty">この項目には登録がありません。</div>';return}el.grid.innerHTML=list.map(r=>{const photos=photoPathsOf(r),pend=pendingOf(r.id),count=photos.length+pend.length;const remoteSaving=remoteUploadPending(r);const failed=remoteUploadFailed(r);const saving=pend.length>0||remoteSaving;const preview=pend.length?pend[pend.length-1].url:'';const emptyState=remoteSaving?'写真保存中…':(failed?photoErrorLabel(r):'写真なし');const photoHtml=count?(preview?`<img src="${esc(preview)}" alt="保存中の写真">`:`<img class="lazy" data-path="${esc(photos[0])}" alt="登録写真">`):`<span class="no-photo">${emptyState}</span>`;return `<article class="card" data-id="${esc(r.id)}"><div class="thumb" data-open="detail">${photoHtml}${count?`<span class="photo-count">写真 ${count}</span>`:''}${saving?'<span class="sync-badge">保存中</span>':(failed?'<span class="sync-badge" style="background:rgba(180,35,24,.92)">要再登録</span>':'')}</div><div class="card-body"><div class="item-title">${esc(titleOf(r))}</div><div class="comment">${esc(r.comment||'コメントなし')}</div><div class="meta"><span>${esc(r.createdByLabel||'')}</span><span>${esc(dateText(r.createdAt))}</span></div></div><div class="card-actions"><button class="btn primary" data-action="photo">＋ 写真アップ</button><button class="btn danger" data-action="delete">削除</button></div></article>`}).join('');
   el.grid.querySelectorAll('.card').forEach(card=>{const id=card.dataset.id;card.querySelector('[data-open=detail]')?.addEventListener('click',()=>openDetail(id));card.querySelector('[data-action=photo]')?.addEventListener('click',()=>openPhotoModal(id));card.querySelector('[data-action=delete]')?.addEventListener('click',()=>removeItem(id));});setupLazy();}
-async function objectUrl(path){if(urlCache.has(path))return urlCache.get(path);const url=await getDownloadURL(storageRef(storage,path));urlCache.set(path,url);return url;}
+async function objectUrl(path){
+  if(urlCache.has(path))return urlCache.get(path);
+  let url='';
+  if(String(path||'').startsWith(PHOTO_MARKER)){
+    const photoDocId=String(path).slice(PHOTO_MARKER.length);
+    const snap=await getDoc(doc(db,META_COLLECTION,photoDocId));
+    const data=snap.exists()?snap.data():null;
+    if(!data?.dataUrl)throw new Error('photo-doc-not-found');
+    url=data.dataUrl;
+  }else{
+    url=await getDownloadURL(storageRef(storage,path));
+  }
+  urlCache.set(path,url);return url;
+}
 function setupLazy(){if(observer)observer.disconnect();const imgs=[...el.grid.querySelectorAll('img.lazy')];if(!('IntersectionObserver'in window)){imgs.forEach(async i=>{try{i.src=await objectUrl(i.dataset.path)}catch{}});return}observer=new IntersectionObserver(entries=>entries.forEach(async e=>{if(!e.isIntersecting)return;observer.unobserve(e.target);try{e.target.src=await objectUrl(e.target.dataset.path)}catch{}}),{rootMargin:'250px'});imgs.forEach(i=>observer.observe(i));}
 
 function revokePreviewImages(root){root.querySelectorAll('img[data-object-url]').forEach(img=>{try{URL.revokeObjectURL(img.dataset.objectUrl)}catch{}});root.innerHTML='';}
@@ -250,18 +265,37 @@ async function compressImage(file,maxSize=1000,quality=.65){
     if(objectUrl)try{URL.revokeObjectURL(objectUrl)}catch{}
   }
 }
-function uploadBlobWithTimeout(path,blob,timeoutMs=UPLOAD_TIMEOUT_MS){
-  const ref=storageRef(storage,path);
-  const uploadPromise=uploadBytes(ref,blob,{contentType:'image/jpeg',cacheControl:'public,max-age=86400'});
-  const timeoutPromise=new Promise((_,reject)=>setTimeout(()=>{const err=new Error('写真アップロードが45秒でタイムアウトしました');err.code='upload-timeout';reject(err)},timeoutMs));
-  return Promise.race([uploadPromise,timeoutPromise]);
+function blobToDataUrl(blob){
+  return new Promise((resolve,reject)=>{const r=new FileReader();r.onload=()=>resolve(String(r.result||''));r.onerror=()=>reject(r.error||new Error('写真データ変換失敗'));r.readAsDataURL(blob)});
 }
-function storagePathForWatchPhoto(itemId){
-  const d=new Date();
-  const y=String(d.getFullYear());
-  const m=String(d.getMonth()+1).padStart(2,'0');
-  const safe=String(itemId||'item').replace(/[^a-zA-Z0-9_-]/g,'_').slice(-90);
-  return `${STORAGE_PREFIX}/${y}/${m}/watch_${safe}_${uniqueId()}.jpg`;
+async function makeFirestorePhotoData(file){
+  const attempts=[[900,.62],[760,.56],[640,.50],[540,.46]];
+  let last='';
+  for(const [size,quality] of attempts){
+    const blob=await compressImage(file,size,quality);
+    const dataUrl=await blobToDataUrl(blob);
+    last=dataUrl;
+    if(dataUrl.length<=PHOTO_DATAURL_MAX_CHARS)return {dataUrl,bytes:blob.size};
+  }
+  const err=new Error(`写真を十分に軽量化できませんでした（${Math.ceil(last.length/1024)}KB）`);err.code='photo-too-large';throw err;
+}
+async function savePhotoToFirestore(itemId,file){
+  const {dataUrl,bytes}=await makeFirestorePhotoData(file);
+  const photoDocId=PHOTO_DOC_PREFIX+uniqueId();
+  await setDoc(doc(db,META_COLLECTION,photoDocId),{
+    kind:'watchlistPhotoV3',itemId,dataUrl,bytes,
+    createdAt:serverTimestamp(),createdBy:auth.currentUser?.email||'',version:VERSION
+  });
+  return PHOTO_MARKER+photoDocId;
+}
+async function deletePhotoAsset(path){
+  const p=String(path||'');
+  if(p.startsWith(PHOTO_MARKER)){
+    const photoDocId=p.slice(PHOTO_MARKER.length);
+    if(photoDocId)await deleteDoc(doc(db,META_COLLECTION,photoDocId));
+    return;
+  }
+  try{await deleteObject(storageRef(storage,p))}catch(err){if(err?.code!=='storage/object-not-found')throw err}
 }
 function photoErrorLabel(r){
   const code=String(r?.photoUploadError||'').trim();
@@ -275,19 +309,8 @@ async function uploadFiles(itemId,files){
   async function worker(){
     while(true){
       const idx=next++;if(idx>=files.length)return;
-      try{
-        let blob=await compressImage(files[idx],1000,.65);
-        const path=storagePathForWatchPhoto(itemId);
-        try{
-          await uploadBlobWithTimeout(path,blob);
-        }catch(firstErr){
-          const code=String(firstErr?.code||'');
-          if(code.includes('unauthorized')||code.includes('bucket-not-found')||code.includes('project-not-found'))throw firstErr;
-          blob=await compressImage(files[idx],800,.58);
-          await uploadBlobWithTimeout(path,blob);
-        }
-        paths[idx]=path;
-      }catch(err){console.error('photo upload failed',err);failures.push({index:idx,error:err})}
+      try{paths[idx]=await savePhotoToFirestore(itemId,files[idx])}
+      catch(err){console.error('photo firestore save failed',err);failures.push({index:idx,error:err})}
     }
   }
   await Promise.all(Array.from({length:workerCount},()=>worker()));
@@ -297,7 +320,7 @@ function startBackgroundPhotoUpload(itemId,files){
   if(!files.length)return;
   const pendingEntries=queuePendingPreviews(itemId,files);
   const uploadToken=uniqueId();
-  toast(`${files.length}枚の写真を保存中です。通常は数秒、遅くても35秒程度で完了します。`);
+  toast(`${files.length}枚の写真を共有保存中です。通常は数秒で完了します。`);
   (async()=>{
     let uploaded=[];
     let result={paths:[],failures:[]};
@@ -320,8 +343,8 @@ function startBackgroundPhotoUpload(itemId,files){
       const latest=recordById(itemId);
       const code=String(err?.code||err?.message||'upload-failed').slice(0,100);
       if(latest){try{await updateDoc(itemDocRef(latest),{photoUploadStatus:'failed',photoUploadPendingCount:0,photoUploadToken:'',photoUploadError:code,photoUploadFailedAt:serverTimestamp(),updatedAt:serverTimestamp(),version:VERSION})}catch{}}
-      for(const p of uploaded){try{await deleteObject(storageRef(storage,p))}catch{}}
-      toast(code==='upload-timeout'?'写真保存がタイムアウトしました。＋写真アップから再登録してください。':`写真保存失敗：${code}`);
+      for(const p of uploaded){try{await deletePhotoAsset(p)}catch{}}
+      toast(`写真保存失敗：${code}`);
     }
   })();
 }
@@ -350,8 +373,8 @@ async function openDetail(id,startIndex=0){const r=recordById(id);if(!r)return;c
 async function refreshDetail(r){const photos=displayPhotosOf(r);const saving=pendingOf(r.id).length>0||remoteUploadPending(r);const failed=remoteUploadFailed(r);if(detailPhotoIndex>=photos.length)detailPhotoIndex=Math.max(0,photos.length-1);el.detailTitle.textContent=titleOf(r);el.detailComment.textContent=r.comment||'コメントなし';el.detailMeta.textContent=[r.createdByLabel,dateText(r.createdAt),saving?'写真保存中':(failed?'写真保存失敗':'')].filter(Boolean).join(' ・ ');el.detailImg.removeAttribute('src');el.detailNoPhoto.textContent=saving?'写真保存中…':(failed?photoErrorLabel(r)+'・＋写真アップから再登録してください':'写真がありません');el.detailNoPhoto.classList.toggle('hidden',photos.length>0);el.detailImg.classList.toggle('hidden',photos.length===0);el.prevPhoto.classList.toggle('hidden',photos.length<=1);el.nextPhoto.classList.toggle('hidden',photos.length<=1);el.detailCount.textContent=photos.length?`${detailPhotoIndex+1} / ${photos.length}`:(saving?'写真保存中…':(failed?'写真保存失敗':'写真 0枚'));el.miniGrid.innerHTML='';if(photos.length){const first=photos[detailPhotoIndex];try{el.detailImg.src=first.kind==='pending'?first.url:await objectUrl(first.path)}catch{toast('写真を読み込めません')}for(let i=0;i<photos.length;i++){const p=photos[i];const div=document.createElement('div');div.className='mini';div.dataset.index=String(i);div.innerHTML=`<img alt="登録写真">${p.kind==='cloud'?'<button class="mini-del" title="この写真を削除">×</button>':'<span class="sync-badge">保存中</span>'}`;div.addEventListener('click',e=>{if(e.target.closest('.mini-del'))return;detailPhotoIndex=i;refreshDetail(r)});if(p.kind==='cloud'){div.querySelector('.mini-del').addEventListener('click',e=>{e.stopPropagation();removePhoto(r.id,p.path)});objectUrl(p.path).then(url=>{const img=div.querySelector('img');if(img)img.src=url}).catch(()=>{})}else{div.querySelector('img').src=p.url}el.miniGrid.appendChild(div)}}else{el.miniGrid.innerHTML=`<div class="hint" style="grid-column:1/-1">${saving?'写真を保存中です。完了後に自動表示されます。':(failed?photoErrorLabel(r)+'。＋写真アップから再登録してください。':'写真はまだありません。')}</div>`}}
 function closeDetail(){el.detail.classList.add('hidden');el.detailImg.removeAttribute('src');document.body.style.overflow='';currentId=null;detailPhotoIndex=0}
 function stepPhoto(delta){const r=recordById(currentId);if(!r)return;const photos=displayPhotosOf(r);if(photos.length<=1)return;detailPhotoIndex=(detailPhotoIndex+delta+photos.length)%photos.length;refreshDetail(r)}
-async function removePhoto(itemId,path){const r=recordById(itemId);if(!r)return;if(!confirm('この写真だけを削除しますか？'))return;loading(true,'写真を削除中...');try{const next=photoPathsOf(r).filter(p=>p!==path);await updateDoc(itemDocRef(r),{photoPaths:next,updatedAt:serverTimestamp(),updatedBy:auth.currentUser?.email||'',version:VERSION});try{await deleteObject(storageRef(storage,path))}catch(err){if(err?.code!=='storage/object-not-found')console.warn(err)}const u=urlCache.get(path);if(u){URL.revokeObjectURL(u);urlCache.delete(path)}detailPhotoIndex=0;toast('写真を削除しました')}catch(err){console.error(err);alert('写真の削除に失敗しました。')}finally{loading(false)}}
-async function removeItem(id){const r=recordById(id);if(!r)return;if(!confirm(`「${titleOf(r)}」を削除しますか？\n登録写真もすべて削除します。`))return;loading(true,'項目を削除中...');try{await deleteDoc(itemDocRef(r));for(const p of photoPathsOf(r)){try{await deleteObject(storageRef(storage,p))}catch(err){if(err?.code!=='storage/object-not-found')console.warn(err)}const u=urlCache.get(p);if(u){URL.revokeObjectURL(u);urlCache.delete(p)}}if(currentId===id)closeDetail();toast('項目を削除しました')}catch(err){console.error(err);alert('削除に失敗しました。')}finally{loading(false)}}
+async function removePhoto(itemId,path){const r=recordById(itemId);if(!r)return;if(!confirm('この写真だけを削除しますか？'))return;loading(true,'写真を削除中...');try{const next=photoPathsOf(r).filter(p=>p!==path);await updateDoc(itemDocRef(r),{photoPaths:next,updatedAt:serverTimestamp(),updatedBy:auth.currentUser?.email||'',version:VERSION});try{await deletePhotoAsset(path)}catch(err){console.warn(err)}urlCache.delete(path);detailPhotoIndex=0;toast('写真を削除しました')}catch(err){console.error(err);alert('写真の削除に失敗しました。')}finally{loading(false)}}
+async function removeItem(id){const r=recordById(id);if(!r)return;if(!confirm(`「${titleOf(r)}」を削除しますか？\n登録写真もすべて削除します。`))return;loading(true,'項目を削除中...');try{await deleteDoc(itemDocRef(r));for(const p of photoPathsOf(r)){try{await deletePhotoAsset(p)}catch(err){console.warn(err)}urlCache.delete(p)}if(currentId===id)closeDetail();toast('項目を削除しました')}catch(err){console.error(err);alert('削除に失敗しました。')}finally{loading(false)}}
 
 el.loginBtn.addEventListener('click',login);el.loginPw.addEventListener('keydown',e=>{if(e.key==='Enter')login()});el.logoutBtn.addEventListener('click',()=>signOut(auth));el.searchInput.addEventListener('input',render);document.querySelectorAll('[data-filter]').forEach(btn=>btn.addEventListener('click',()=>setCategoryFilter(btn.dataset.filter)));el.showAllBtn.addEventListener('click',()=>setCategoryFilter(''));el.newItemBtn.addEventListener('click',()=>openAddItem(selectedCategoryForNew()));el.itemCancelBtn.addEventListener('click',closeItemModal);el.itemForm.addEventListener('submit',saveItem);el.initialPhotos.addEventListener('change',()=>renderLocalPreviews(el.initialPhotos,el.initialPreview));el.photoUploadInput.addEventListener('change',()=>renderLocalPreviews(el.photoUploadInput,el.photoUploadPreview));el.photoCancelBtn.addEventListener('click',closePhotoModal);el.photoUploadBtn.addEventListener('click',uploadPhotosToCurrent);el.detailClose.addEventListener('click',closeDetail);el.prevPhoto.addEventListener('click',()=>stepPhoto(-1));el.nextPhoto.addEventListener('click',()=>stepPhoto(1));el.detailAddPhotoBtn.addEventListener('click',()=>{const id=currentId;closeDetail();openPhotoModal(id)});el.editBtn.addEventListener('click',()=>{const id=currentId;closeDetail();openEditItem(id)});el.deleteBtn.addEventListener('click',()=>removeItem(currentId));document.addEventListener('keydown',e=>{if(el.detail.classList.contains('hidden'))return;if(e.key==='Escape')closeDetail();if(e.key==='ArrowLeft')stepPhoto(-1);if(e.key==='ArrowRight')stepPhoto(1)});
 
